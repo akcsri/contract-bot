@@ -393,11 +393,13 @@ def create_nda_approval_request(
     *, title: str, counterparty: str, contract_date: str,
     receipt_id: int, section_id: int, method: str, mail_address: str = "",
 ) -> dict:
-    """NDA契約締結申請(freeeの汎用申請フォーム)を作成する。
+    """NDA契約締結申請(freeeの汎用申請フォーム, form_id=87137)を作成する。
 
-    request_itemsの並び・typeは、既存の承認済みNDA申請(form_id=87137)を
-    参考に組み立てている。freee側でフォーム定義(項目の追加/削除/並び替え)
-    が変更された場合はここも合わせて調整すること。
+    各項目には、freee側のフォーム定義に紐づく固定の`id`を指定する必要がある
+    (`type`と`value`だけでは「Idを入力してください」というバリデーション
+    エラーになる)。このidはブラウザの実際のフォーム(下書き保存時のリクエスト
+    ペイロード)から採取したもので、フォーム定義が変わらない限り固定。
+    フォームの項目が追加/削除/並び替えされた場合はここも合わせて調整すること。
     最初のmulti_lineは「原本送付先」欄(押印方法が原本捺印の場合のみ使用)。
     """
     body = {
@@ -407,16 +409,16 @@ def create_nda_approval_request(
         "title": title,
         "draft": False,  # false = 下書きではなく即申請する
         "request_items": [
-            {"type": "title", "value": title},
-            {"type": "section", "value": str(section_id)},
-            {"type": "single_line", "value": counterparty},
-            {"type": "partner", "value": ""},
-            {"type": "date", "value": contract_date},
-            {"type": "receipt", "value": str(receipt_id)},
-            {"type": "select", "value": method},
-            {"type": "multi_line", "value": mail_address},
-            {"type": "multi_line", "value": ""},
-            {"type": "multi_line", "value": ""},
+            {"id": 346116, "type": "title", "value": title},
+            {"id": 57980, "type": "section", "value": str(section_id)},
+            {"id": 789358, "type": "single_line", "value": counterparty},
+            {"id": 32070, "type": "partner", "value": ""},
+            {"id": 293716, "type": "date", "value": contract_date},
+            {"id": 555747, "type": "receipt", "value": str(receipt_id)},
+            {"id": 647567, "type": "select", "value": method},
+            {"id": 757585, "type": "multi_line", "value": mail_address},
+            {"id": 757586, "type": "multi_line", "value": ""},
+            {"id": 757587, "type": "multi_line", "value": ""},
         ],
     }
     resp = requests.post(

@@ -1,9 +1,11 @@
 import os
+import io
 import json
 import logging
 
 import requests
 import fitz  # PyMuPDF
+from docx import Document
 
 from google import genai
 from google.genai import types
@@ -28,11 +30,19 @@ gemini_client = genai.Client(api_key=os.environ["GEMINI_API_KEY"])
 # 二重処理防止(Slackのretry/イベント再送対策の簡易ガード)
 _processed_file_ids = set()
 
+PDF_MIMETYPES = {"application/pdf"}
+PDF_FILETYPES = {"pdf"}
+DOCX_MIMETYPES = {
+    "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+}
+DOCX_FILETYPES = {"docx"}
+
 NDA_ANALYSIS_PROMPT = """\
-あなたは契約書を分析する専門家です。添付のPDF(スキャン画像のみで
-テキスト層が無い場合も、画像として内容を読み取って判断してください)
-を確認し、以下の項目をJSON形式のみで回答してください。説明文や
-コードブロックのマークダウンは付けず、JSONオブジェクトのみを返すこと。
+あなたは契約書を分析する専門家です。提供された契約書(PDFの場合は
+スキャン画像のみでテキスト層が無いこともあるので、画像として内容を
+読み取って判断してください)を確認し、以下の項目をJSON形式のみで
+回答してください。説明文やコードブロックのマークダウンは付けず、
+JSONオブジェクトのみを返すこと。
 
 {
   "is_nda": true または false (秘密保持契約/NDAであればtrue),
@@ -42,6 +52,14 @@ NDA_ANALYSIS_PROMPT = """\
   "reason": "is_ndaと判定した理由の要約(1〜2文)"
 }
 """
+
+
+def is_pdf_file(f: dict) -> bool:
+    return f.get("mimetype") in PDF_MIMETYPES or f.get("filetype") in PDF_FILETYPES
+
+
+def is_docx_file(f: dict) -> bool:
+    return f.get("mimetype") in DOCX_MIMETYPES or f.get("filetype") in DOCX_FILETYPES
 
 
 def download_slack_file(file_info: dict) -> bytes:
@@ -64,17 +82,40 @@ def get_pdf_page_count(pdf_bytes: bytes) -> int:
         doc.close()
 
 
-def analyze_contract_with_gemini(pdf_bytes: bytes) -> dict:
-    """PDFバイナリをそのままGeminiに渡し、NDA判定を含む解析結果を得る。
-    テキスト層の無いスキャンPDF(捺印済み契約書等)でもGeminiが
-    画像として内容を読み取れるため、OCR処理を別途行う必要がない。
+def extract_docx_text(docx_bytes: bytes) -> str:
+    """python-docxで段落・表のテキストを抽出する"""
+    doc = Document(io.BytesIO(docx_bytes))
+    parts = [p.text for p in doc.paragraphs if p.text.strip()]
+    for table in doc.tables:
+        for row in table.rows:
+            for cell in row.cells:
+                if cell.text.strip():
+                    parts.append(cell.text)
+    return "\n".join(parts)
+
+
+def analyze_contract_with_gemini(*, pdf_bytes: bytes = None, text: str = None) -> dict:
+    """契約書(PDFバイナリ、またはWordから抽出済みのテキスト)をGeminiに渡し、
+    NDA判定を含む解析結果を得る。
+    PDFはスキャン画像(テキスト層無し)でもGeminiが画像として読み取れるため
+    OCR処理を別途行う必要がない。Wordは事前にテキスト抽出したものを渡す。
     """
-    response = gemini_client.models.generate_content(
-        model=GEMINI_MODEL,
-        contents=[
+    if pdf_bytes is not None:
+        contents = [
             types.Part.from_bytes(data=pdf_bytes, mime_type="application/pdf"),
             NDA_ANALYSIS_PROMPT,
-        ],
+        ]
+    elif text is not None:
+        contents = [
+            NDA_ANALYSIS_PROMPT,
+            f"\n--- 契約書本文(Wordファイルから抽出) ---\n{text}",
+        ]
+    else:
+        raise ValueError("pdf_bytes または text のいずれかが必要です")
+
+    response = gemini_client.models.generate_content(
+        model=GEMINI_MODEL,
+        contents=contents,
         config=types.GenerateContentConfig(
             response_mime_type="application/json",
         ),
@@ -82,12 +123,12 @@ def analyze_contract_with_gemini(pdf_bytes: bytes) -> dict:
     return json.loads(response.text)
 
 
-def format_analysis_message(filename: str, page_count: int, result: dict) -> str:
+def format_analysis_message(filename: str, meta_line: str, result: dict) -> str:
     is_nda = result.get("is_nda")
     judgement = "✅ NDA(秘密保持契約)と判定" if is_nda else "❌ NDAではないと判定"
     parties = "、".join(result.get("parties") or []) or "不明"
     return (
-        f"PDFを受信しました: *{filename}* (ページ数: {page_count})\n"
+        f"ファイルを受信しました: *{filename}* ({meta_line})\n"
         f"{judgement}\n"
         f"書類種別: {result.get('document_type', '不明')}\n"
         f"契約当事者: {parties}\n"
@@ -97,20 +138,16 @@ def format_analysis_message(filename: str, page_count: int, result: dict) -> str
     )
 
 
-def handle_pdf_files(event: dict, say):
+def handle_contract_files(event: dict, say):
     files = event.get("files", [])
-    pdf_files = [
-        f for f in files
-        if f.get("mimetype") == "application/pdf"
-        or f.get("filetype") == "pdf"
-    ]
+    target_files = [f for f in files if is_pdf_file(f) or is_docx_file(f)]
 
-    if not pdf_files:
+    if not target_files:
         return
 
-    for f in pdf_files:
+    for f in target_files:
         file_id = f.get("id")
-        filename = f.get("name", "unknown.pdf")
+        filename = f.get("name", "unknown")
 
         if file_id in _processed_file_ids:
             logger.info(f"[SKIP] already processed: {filename} ({file_id})")
@@ -118,25 +155,37 @@ def handle_pdf_files(event: dict, say):
         _processed_file_ids.add(file_id)
 
         try:
-            logger.info(f"[PDF] downloading: {filename} ({file_id})")
-            pdf_bytes = download_slack_file(f)
-            page_count = get_pdf_page_count(pdf_bytes)
+            logger.info(f"[FILE] downloading: {filename} ({file_id})")
+            raw_bytes = download_slack_file(f)
 
-            logger.info(f"[PDF] sending to Gemini({GEMINI_MODEL}): {filename}")
-            result = analyze_contract_with_gemini(pdf_bytes)
-            logger.info(f"[PDF] gemini result: {result}")
+            if is_pdf_file(f):
+                page_count = get_pdf_page_count(raw_bytes)
+                logger.info(f"[PDF] sending to Gemini({GEMINI_MODEL}): {filename}")
+                result = analyze_contract_with_gemini(pdf_bytes=raw_bytes)
+                meta_line = f"ページ数: {page_count}"
 
-            say(format_analysis_message(filename, page_count, result))
+            else:  # docx
+                text = extract_docx_text(raw_bytes)
+                if not text.strip():
+                    logger.warning(f"[DOCX] no extractable text: {filename}")
+                    say(f":warning: Wordファイルからテキストを抽出できませんでした: {filename}")
+                    continue
+                logger.info(f"[DOCX] sending to Gemini({GEMINI_MODEL}): {filename}")
+                result = analyze_contract_with_gemini(text=text)
+                meta_line = f"文字数: {len(text)}"
+
+            logger.info(f"[FILE] gemini result: {result}")
+            say(format_analysis_message(filename, meta_line, result))
 
         except requests.HTTPError as e:
-            logger.exception(f"[PDF] download failed: {filename}")
-            say(f":warning: PDFのダウンロードに失敗しました: {filename} ({e})")
+            logger.exception(f"[FILE] download failed: {filename}")
+            say(f":warning: ファイルのダウンロードに失敗しました: {filename} ({e})")
         except json.JSONDecodeError as e:
-            logger.exception(f"[PDF] gemini response was not valid JSON: {filename}")
+            logger.exception(f"[FILE] gemini response was not valid JSON: {filename}")
             say(f":warning: Geminiの解析結果を読み取れませんでした: {filename} ({e})")
         except Exception as e:
-            logger.exception(f"[PDF] processing failed: {filename}")
-            say(f":warning: PDFの処理に失敗しました: {filename} ({e})")
+            logger.exception(f"[FILE] processing failed: {filename}")
+            say(f":warning: ファイルの処理に失敗しました: {filename} ({e})")
 
 
 @app.event("message")
@@ -156,7 +205,7 @@ def handle_message(event, say, logger):
         return
 
     if event.get("files"):
-        handle_pdf_files(event, say)
+        handle_contract_files(event, say)
         return
 
     # ファイル無しの通常メッセージ(動作確認用)

@@ -31,6 +31,12 @@ FREEE_CLIENT_SECRET = os.environ["FREEE_CLIENT_SECRET"]
 FREEE_REFRESH_TOKEN = os.environ["FREEE_REFRESH_TOKEN"]
 FREEE_COMPANY_ID = int(os.environ["FREEE_COMPANY_ID"])
 FREEE_NDA_FORM_ID = int(os.environ.get("FREEE_NDA_FORM_ID", "87137"))
+# 「NDA契約締結申請」フォームの「申請経路の選択」に対応する必須項目。
+# NDA締結申請の経路(プロジェクトオーナー→リーガル(金子)→コーポレート(吉田))のID。
+FREEE_APPROVAL_FLOW_ROUTE_ID = int(os.environ.get("FREEE_APPROVAL_FLOW_ROUTE_ID", "1431338"))
+# 認可コード取得時に指定したコールバックURLと同じ値を指定する
+# (ブラウザで手動取得した場合は "urn:ietf:wg:oauth:2.0:oob")
+FREEE_REDIRECT_URI = os.environ.get("FREEE_REDIRECT_URI", "urn:ietf:wg:oauth:2.0:oob")
 
 FREEE_API_BASE = "https://api.freee.co.jp"
 FREEE_TOKEN_URL = "https://accounts.secure.freee.co.jp/public_api/token"
@@ -64,7 +70,7 @@ DOCX_MIMETYPES = {
 DOCX_FILETYPES = {"docx"}
 
 FIELD_REPLY_PATTERN = re.compile(
-    r"部門[:：]\s*(?P<section>\S+)\s*/\s*締結方法[:：]\s*(?P<method>.+)"
+    r"プロジェクト名?[:：]\s*(?P<section>\S+)\s*/\s*締結方法[:：]\s*(?P<method>.+)"
 )
 
 NDA_ANALYSIS_PROMPT = """\
@@ -209,6 +215,7 @@ def get_freee_access_token() -> str:
             "client_id": FREEE_CLIENT_ID,
             "client_secret": FREEE_CLIENT_SECRET,
             "refresh_token": _freee_token_cache["refresh_token"],
+            "redirect_uri": FREEE_REDIRECT_URI,
         },
         timeout=30,
     )
@@ -226,6 +233,9 @@ def freee_headers() -> dict:
 
 
 def fetch_freee_sections() -> list:
+    """freeeの「部門」マスタを取得する。このフォーム上では部門IDが
+    「プロジェクト名」として運用されている(プロジェクト名: CSRI = 不紐づけ用)。
+    """
     global _sections_cache
     if _sections_cache is not None:
         return _sections_cache
@@ -241,6 +251,7 @@ def fetch_freee_sections() -> list:
 
 
 def find_section_id_by_name(name: str):
+    """プロジェクト名(freee上は部門名)からIDを引く"""
     for s in fetch_freee_sections():
         if s.get("name") == name:
             return s.get("id")
@@ -273,6 +284,7 @@ def create_nda_approval_request(
     body = {
         "company_id": FREEE_COMPANY_ID,
         "form_id": FREEE_NDA_FORM_ID,
+        "approval_flow_route_id": FREEE_APPROVAL_FLOW_ROUTE_ID,
         "title": title,
         "request_items": [
             {"type": "title", "value": title},
@@ -353,8 +365,9 @@ def handle_contract_files(event: dict, say):
                 say(
                     text=(
                         "freee申請作成のため、このスレッドで下記の形式で返信してください。\n"
-                        f"`部門: <部門名> / 締結方法: <{' か '.join(CONTRACT_METHODS)}>`\n"
-                        f"例: `部門: 事業開発部 / 締結方法: {CONTRACT_METHODS[0]}`"
+                        "(プロジェクトに紐づかない契約書は「CSRI」を指定してください)\n"
+                        f"`プロジェクト名: <プロジェクト名> / 締結方法: <{' か '.join(CONTRACT_METHODS)}>`\n"
+                        f"例: `プロジェクト名: CSRI / 締結方法: {CONTRACT_METHODS[0]}`"
                     ),
                     thread_ts=thread_ts,
                 )
@@ -371,7 +384,7 @@ def handle_contract_files(event: dict, say):
 
 
 def handle_nda_field_reply(event: dict, say) -> bool:
-    """NDA申請の「部門 / 締結方法」返信をスレッド内で処理する。
+    """NDA申請の「プロジェクト名 / 締結方法」返信をスレッド内で処理する。
     処理した場合True、対象外ならFalseを返す。
     """
     thread_ts = event.get("thread_ts")
@@ -384,7 +397,7 @@ def handle_nda_field_reply(event: dict, say) -> bool:
     if not m:
         say(
             "形式が読み取れませんでした。次の形式で返信してください。\n"
-            f"`部門: <部門名> / 締結方法: <{' か '.join(CONTRACT_METHODS)}>`",
+            f"`プロジェクト名: <プロジェクト名> / 締結方法: <{' か '.join(CONTRACT_METHODS)}>`",
             thread_ts=thread_ts,
         )
         return True
@@ -403,13 +416,14 @@ def handle_nda_field_reply(event: dict, say) -> bool:
         section_id = find_section_id_by_name(section_name)
     except Exception as e:
         logger.exception("[freee] fetch sections failed")
-        say(f":warning: freeeの部門一覧取得に失敗しました: {e}", thread_ts=thread_ts)
+        say(f":warning: freeeのプロジェクト一覧取得に失敗しました: {e}", thread_ts=thread_ts)
         return True
 
     if section_id is None:
         say(
-            f":warning: 部門「{section_name}」がfreee上に見つかりません。"
-            "freeeに登録されている部門名と完全に一致させて返信してください。",
+            f":warning: プロジェクト「{section_name}」がfreee上に見つかりません。"
+            "freeeに登録されているプロジェクト名(部門名)と完全に一致させて返信してください"
+            "(紐づかない場合は「CSRI」)。",
             thread_ts=thread_ts,
         )
         return True
@@ -426,7 +440,7 @@ def handle_nda_field_reply(event: dict, say) -> bool:
         f"タイトル: {pending['filename']}\n"
         f"契約当事者: {'、'.join(result.get('parties') or []) or '不明'}\n"
         f"契約日: {result.get('contract_date') or '不明'}\n"
-        f"部門: {section_name}\n"
+        f"プロジェクト名: {section_name}\n"
         f"締結方法: {method}"
     )
     posted = say(confirm_text, thread_ts=thread_ts)
@@ -495,8 +509,9 @@ def handle_reaction_added(event, say, logger):
 
         result = pending["gemini_result"]
         logger.info(f"[freee] creating approval request: {pending['filename']}")
+        contract_title = os.path.splitext(pending["filename"])[0]
         approval = create_nda_approval_request(
-            title=pending["filename"],
+            title=contract_title,
             counterparty="、".join(result.get("parties") or []) or "不明",
             contract_date=result.get("contract_date") or "",
             receipt_id=receipt_id,

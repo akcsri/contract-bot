@@ -41,6 +41,12 @@ FREEE_REDIRECT_URI = os.environ.get("FREEE_REDIRECT_URI", "urn:ietf:wg:oauth:2.0
 FREEE_API_BASE = "https://api.freee.co.jp"
 FREEE_TOKEN_URL = "https://accounts.secure.freee.co.jp/public_api/token"
 
+# --- Render API (ローテーションするrefresh_tokenを永続化するため) --------
+# 未設定の場合は永続化をスキップする(従来通りメモリ内のみの保持になる)。
+RENDER_API_KEY = os.environ.get("RENDER_API_KEY")
+RENDER_SERVICE_ID = os.environ.get("RENDER_SERVICE_ID")
+RENDER_API_BASE = "https://api.render.com/v1"
+
 # 契約締結方法の選択肢(freee上のフォームの選択肢と一致させること。
 # 増やす/変える場合はここを編集してください)
 CONTRACT_METHODS = ["電子署名（CSRI発信）", "原本捺印"]
@@ -263,7 +269,44 @@ def get_freee_access_token() -> str:
     _freee_token_cache["refresh_token"] = data["refresh_token"]
     _freee_token_cache["expires_at"] = now + data["expires_in"]
     logger.info("[freee] access token refreshed")
+    persist_refresh_token_to_render(data["refresh_token"])
     return _freee_token_cache["access_token"]
+
+
+def persist_refresh_token_to_render(new_refresh_token: str):
+    """ローテーションされたrefresh_tokenをRenderの環境変数に書き戻す。
+
+    これをしないと、プロセス再起動のたびに環境変数の古い(すでに使用済みの)
+    refresh_tokenが読み込まれ、invalid_grantで失敗し続ける。
+    RENDER_API_KEY / RENDER_SERVICE_ID が未設定の場合は何もしない
+    (その場合は再起動のたびに手動での再認可が必要になる)。
+
+    注意: Renderの環境変数を更新すると、そのサービスは自動的に再デプロイ
+    される。そのため、アクセストークンの更新(=このタイミング)のたびに
+    短い再起動が発生する。
+    """
+    if not RENDER_API_KEY or not RENDER_SERVICE_ID:
+        logger.warning(
+            "[render] RENDER_API_KEY/RENDER_SERVICE_ID未設定のため、"
+            "refresh_tokenの永続化をスキップします(再起動すると失効する可能性があります)"
+        )
+        return
+    try:
+        resp = requests.put(
+            f"{RENDER_API_BASE}/services/{RENDER_SERVICE_ID}/env-vars/FREEE_REFRESH_TOKEN",
+            headers={
+                "Authorization": f"Bearer {RENDER_API_KEY}",
+                "Content-Type": "application/json",
+            },
+            json={"value": new_refresh_token},
+            timeout=15,
+        )
+        if not resp.ok:
+            logger.error(f"[render] env var update failed: {resp.status_code} {resp.text}")
+            return
+        logger.info("[render] FREEE_REFRESH_TOKENをRenderに永続化しました")
+    except Exception:
+        logger.exception("[render] refresh_tokenの永続化に失敗しました")
 
 
 def freee_headers() -> dict:

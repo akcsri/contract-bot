@@ -15,7 +15,7 @@ def handle_message(event, say):
     print(json.dumps(event, ensure_ascii=False, indent=2))
     print("===================================")
 
-    say("イベントを受信しました")
+    say("イベント受信成功")
 
 if __name__ == "__main__":
 

@@ -1,12 +1,22 @@
+print("APP LOADED")
+
 import os
 
-print("APP LOADED")
-print("FILE=", __file__)
+print("IMPORT OS")
 
 from slack_bolt import App
+
+print("IMPORT APP")
+
 from slack_bolt.adapter.socket_mode import SocketModeHandler
 
-print("IMPORT OK")
+print("IMPORT SOCKET")
+
+print("BOT TOKEN EXISTS",
+      "SLACK_BOT_TOKEN" in os.environ)
+
+print("APP TOKEN EXISTS",
+      "SLACK_APP_TOKEN" in os.environ)
 
 app = App(
     token=os.environ["SLACK_BOT_TOKEN"]
@@ -21,6 +31,7 @@ def handle_message(event, say):
 print("EVENT REGISTERED")
 
 if __name__ == "__main__":
+
     print("BOT START")
 
     handler = SocketModeHandler(

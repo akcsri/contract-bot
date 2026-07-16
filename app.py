@@ -1,44 +1,56 @@
-print("APP LOADED")
-
 import os
-
-print("IMPORT OS")
+import requests
 
 from slack_bolt import App
-
-print("IMPORT APP")
-
 from slack_bolt.adapter.socket_mode import SocketModeHandler
-
-print("IMPORT SOCKET")
-
-print("BOT TOKEN EXISTS",
-      "SLACK_BOT_TOKEN" in os.environ)
-
-print("APP TOKEN EXISTS",
-      "SLACK_APP_TOKEN" in os.environ)
 
 app = App(
     token=os.environ["SLACK_BOT_TOKEN"]
 )
 
-print("APP CREATED")
+SLACK_BOT_TOKEN = os.environ["SLACK_BOT_TOKEN"]
 
 @app.event("message")
 def handle_message(event, say):
-    say("受信しました")
 
-print("EVENT REGISTERED")
+    if event.get("subtype"):
+        return
+
+    files = event.get("files", [])
+
+    if not files:
+        say("PDFが添付されていません")
+        return
+
+    file_info = files[0]
+
+    file_name = file_info["name"]
+
+    url = file_info["url_private_download"]
+
+    say(
+        f"受信しました\nファイル名: {file_name}"
+    )
+
+    headers = {
+        "Authorization":
+        f"Bearer {SLACK_BOT_TOKEN}"
+    }
+
+    response = requests.get(
+        url,
+        headers=headers
+    )
+
+    with open("/tmp/contract.pdf", "wb") as f:
+        f.write(response.content)
+
+    say("PDFダウンロード成功")
+
 
 if __name__ == "__main__":
 
-    print("BOT START")
-
-    handler = SocketModeHandler(
+    SocketModeHandler(
         app,
         os.environ["SLACK_APP_TOKEN"]
-    )
-
-    print("SOCKET START")
-
-    handler.start()
+    ).start()

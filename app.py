@@ -68,6 +68,23 @@ _processed_file_ids = set()
 # 注意: プロセス内メモリのみ。Renderの再起動で消える簡易実装。
 _pending_nda = {}
 
+# --- プロジェクト名 → freee部門(section)ID の対応表 -----------------
+# 本来は /api/1/sections から動的取得する想定だったが、このfreee
+# アカウントのユーザー権限では同APIが user_do_not_have_permission で
+# 使えないため、判明した対応を手動でここに追加していく運用にしている。
+#
+# 新しいプロジェクトのIDを調べる方法:
+#   1. freeeの「各種申請の作成」(NDA契約締結申請)画面を開く
+#   2. ブラウザのDevTools → 「ネットワーク」タブを開いた状態で
+#      「プロジェクト名」のプルダウンから対象のプロジェクトを選択する
+#   3. 直後に飛ぶ `tags_history` へのリクエストのペイロードを見ると
+#      {"tags": [{"category_name": "section", "id": <ID>}]} が確認できる
+#   4. その <ID> と選択したプロジェクト名をこの辞書に追記する
+KNOWN_PROJECT_SECTION_IDS = {
+    "CSRI": 3269199,
+    "アバウテック": 3247109,
+}
+
 PDF_MIMETYPES = {"application/pdf"}
 PDF_FILETYPES = {"pdf"}
 DOCX_MIMETYPES = {
@@ -314,8 +331,13 @@ def freee_headers() -> dict:
 
 
 def fetch_freee_sections() -> list:
-    """freeeの「部門」マスタを取得する。このフォーム上では部門IDが
-    「プロジェクト名」として運用されている(プロジェクト名: CSRI = 不紐づけ用)。
+    """freeeの「部門」マスタをAPIから取得する。
+
+    注意: このfreeeアカウントのユーザー権限では、/api/1/sections は
+    user_do_not_have_permission で使用できないことが判明している。
+    そのため通常の実行パスではこの関数は使わず、KNOWN_PROJECT_SECTION_IDS
+    (手動管理の対応表)を正として使う。将来的に権限が解決した場合に
+    備えて関数自体は残してある。
     """
     global _sections_cache
     if _sections_cache is not None:
@@ -333,12 +355,17 @@ def fetch_freee_sections() -> list:
     return _sections_cache
 
 
+def get_project_candidates() -> list:
+    """Geminiのプロジェクト名推定に使う候補名一覧(手動管理の対応表のキー)"""
+    return list(KNOWN_PROJECT_SECTION_IDS.keys())
+
+
 def find_section_id_by_name(name: str):
-    """プロジェクト名(freee上は部門名)からIDを引く"""
-    for s in fetch_freee_sections():
-        if s.get("name") == name:
-            return s.get("id")
-    return None
+    """プロジェクト名(freee上は部門名)からIDを引く。
+    KNOWN_PROJECT_SECTION_IDSに無い場合はNoneを返す
+    (新しいプロジェクトはtags_history経由でIDを調べて辞書に追記すること)。
+    """
+    return KNOWN_PROJECT_SECTION_IDS.get(name)
 
 
 def upload_file_to_freee(file_bytes: bytes, filename: str) -> int:
@@ -410,7 +437,9 @@ def post_confirmation(pending: dict, thread_ts: str, say):
         f"タイトル: {pending['filename']}",
         f"契約当事者: {'、'.join(result.get('parties') or []) or '不明'}",
         f"契約日: {result.get('contract_date') or '不明'}",
-        f"プロジェクト名: {pending['section_name']}",
+        f"プロジェクト名: {pending['section_name']}"
+        + ("(特定できなかったため自動設定。違う場合はfreee上で修正してください)"
+           if pending.get("project_auto_defaulted") else ""),
         f"締結方法: {pending['method']}",
     ]
     if pending.get("mail_address"):
@@ -448,12 +477,8 @@ def handle_contract_files(event: dict, say):
     message_ts = event.get("ts")
     message_text = event.get("text", "")
 
-    # プロジェクト名の自動判定に使う候補一覧(取得できなくても処理は続行する)
-    try:
-        project_candidates = [s.get("name") for s in fetch_freee_sections() if s.get("name")]
-    except Exception:
-        logger.exception("[freee] fetch sections failed (project候補取得)")
-        project_candidates = []
+    # プロジェクト名の自動判定に使う候補一覧(KNOWN_PROJECT_SECTION_IDSより)
+    project_candidates = get_project_candidates()
 
     for f in target_files:
         file_id = f.get("id")
@@ -508,14 +533,22 @@ def handle_contract_files(event: dict, say):
 
             section_id = None
             if project_name:
-                try:
-                    section_id = find_section_id_by_name(project_name)
-                except Exception:
-                    logger.exception("[freee] fetch sections failed")
-                    section_id = None
+                section_id = find_section_id_by_name(project_name)
+
+            project_auto_defaulted = False
+            if section_id is None:
+                # 自信をもって特定できなかった場合は、プロジェクトに
+                # 紐づかない契約として扱い、自動でCSRIにフォールバックする
+                # (Slackでの聞き返しはしない。必要ならfreee上で本人が修正する)。
+                fallback_id = KNOWN_PROJECT_SECTION_IDS.get("CSRI")
+                if fallback_id is not None:
+                    section_id = fallback_id
+                    project_name = "CSRI"
+                    project_auto_defaulted = True
 
             missing_fields = []
             if section_id is None:
+                # CSRI自体が対応表に無い場合のみ(通常起きない)、聞き返しにフォールバック
                 missing_fields.append("project_name")
                 project_name = ""
             if method not in CONTRACT_METHODS:
@@ -528,6 +561,7 @@ def handle_contract_files(event: dict, say):
                 "gemini_result": result,
                 "section_id": section_id,
                 "section_name": project_name,
+                "project_auto_defaulted": project_auto_defaulted,
                 "method": method,
                 "mail_address": mail_address if method == "原本捺印" else "",
                 "missing_fields": missing_fields,
@@ -568,18 +602,14 @@ def handle_nda_field_reply(event: dict, say) -> bool:
         m = PROJECT_REPLY_PATTERN.search(text)
         if m:
             section_name = m.group(1).strip()
-            try:
-                section_id = find_section_id_by_name(section_name)
-            except Exception as e:
-                logger.exception("[freee] fetch sections failed")
-                say(f":warning: freeeのプロジェクト一覧取得に失敗しました: {e}", thread_ts=thread_ts)
-                return True
+            section_id = find_section_id_by_name(section_name)
 
             if section_id is None:
                 say(
-                    f":warning: プロジェクト「{section_name}」がfreee上に見つかりません。"
-                    "freeeに登録されているプロジェクト名(部門名)と完全に一致させて返信してください"
-                    "(紐づかない場合は「CSRI」)。",
+                    f":warning: プロジェクト「{section_name}」は対応表(KNOWN_PROJECT_SECTION_IDS)に"
+                    "登録されていません。登録済みのプロジェクト名と完全に一致させて返信するか"
+                    "(紐づかない場合は「CSRI」)、freee上でtags_history経由でIDを調べて"
+                    "コードに追記してください。",
                     thread_ts=thread_ts,
                 )
                 return True

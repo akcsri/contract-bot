@@ -240,6 +240,10 @@ def get_freee_access_token() -> str:
     if _freee_token_cache["access_token"] and now < _freee_token_cache["expires_at"] - 60:
         return _freee_token_cache["access_token"]
 
+    logger.info(
+        f"[freee] refreshing access token (redirect_uri={FREEE_REDIRECT_URI}, "
+        f"refresh_token末尾={_freee_token_cache['refresh_token'][-6:]})"
+    )
     resp = requests.post(
         FREEE_TOKEN_URL,
         data={
@@ -251,6 +255,8 @@ def get_freee_access_token() -> str:
         },
         timeout=30,
     )
+    if not resp.ok:
+        logger.error(f"[freee] token refresh failed: {resp.status_code} {resp.text}")
     resp.raise_for_status()
     data = resp.json()
     _freee_token_cache["access_token"] = data["access_token"]

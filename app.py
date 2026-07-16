@@ -283,6 +283,8 @@ def fetch_freee_sections() -> list:
         params={"company_id": FREEE_COMPANY_ID},
         timeout=30,
     )
+    if not resp.ok:
+        logger.error(f"[freee] sections fetch failed: {resp.status_code} {resp.text}")
     resp.raise_for_status()
     _sections_cache = resp.json().get("sections", [])
     return _sections_cache
@@ -305,6 +307,8 @@ def upload_file_to_freee(file_bytes: bytes, filename: str) -> int:
         files={"receipt": (filename, file_bytes)},
         timeout=60,
     )
+    if not resp.ok:
+        logger.error(f"[freee] receipt upload failed: {resp.status_code} {resp.text}")
     resp.raise_for_status()
     return resp.json()["receipt"]["id"]
 
@@ -344,6 +348,8 @@ def create_nda_approval_request(
         json=body,
         timeout=30,
     )
+    if not resp.ok:
+        logger.error(f"[freee] approval request creation failed: {resp.status_code} {resp.text}")
     resp.raise_for_status()
     return resp.json()["approval_request"]
 

@@ -69,24 +69,42 @@ DOCX_MIMETYPES = {
 }
 DOCX_FILETYPES = {"docx"}
 
-FIELD_REPLY_PATTERN = re.compile(
-    r"プロジェクト名?[:：]\s*(?P<section>\S+)\s*/\s*締結方法[:：]\s*(?P<method>.+)"
-)
+# 不足項目を聞き返すときに使う個別パターン(どちらか一方だけの返信でも拾える)
+PROJECT_REPLY_PATTERN = re.compile(r"プロジェクト名?[:：]\s*(\S+)")
+METHOD_REPLY_PATTERN = re.compile(r"締結方法[:：]\s*(.+)")
 
-NDA_ANALYSIS_PROMPT = """\
-あなたは契約書を分析する専門家です。提供された契約書(PDFの場合は
-スキャン画像のみでテキスト層が無いこともあるので、画像として内容を
-読み取って判断してください)を確認し、以下の項目をJSON形式のみで
-回答してください。説明文やコードブロックのマークダウンは付けず、
-JSONオブジェクトのみを返すこと。
 
-{
+def build_nda_prompt(project_candidates: list) -> str:
+    candidates_text = "、".join(project_candidates) if project_candidates else "(候補リスト取得不可)"
+    return f"""\
+あなたは契約書の申請処理を行う専門アシスタントです。
+提供された契約書本体(PDFの場合はスキャン画像のみでテキスト層が無い
+こともあるので、画像として内容を読み取って判断してください)に加えて、
+Slack投稿の本文とファイル名も参考情報として渡されます。契約書の内容
+だけでなく、投稿本文・ファイル名に書かれている情報もすべて確認し、
+そこに既に書かれている情報は憶測せずそのまま採用してください。
+どこにも情報が無い項目だけをnullにしてください。
+
+以下の項目をJSON形式のみで回答してください。説明文やコードブロックの
+マークダウンは付けず、JSONオブジェクトのみを返すこと。
+
+{{
   "is_nda": true または false (秘密保持契約/NDAであればtrue),
   "document_type": "書類の種類(例: 秘密保持契約書, 業務委託契約書 等)",
   "parties": ["契約当事者1", "契約当事者2"],
   "contract_date": "YYYY-MM-DD形式の契約日。読み取れない場合はnull",
-  "reason": "is_ndaと判定した理由の要約(1〜2文)"
-}
+  "reason": "is_ndaと判定した理由の要約(1〜2文)",
+  "project_name": "次の候補の中から一致するものを1つだけ選んで文字列で返す: [{candidates_text}]。
+    ファイル名や投稿本文にプロジェクト名/顧客名らしき記載があれば最優先で使い、
+    候補の中から最も一致するものを選ぶこと。プロジェクトに紐づかない場合や
+    候補に一致するものが無い場合はnull",
+  "method": "契約の締結方法。投稿本文に「捺印」「押印」とあれば\\"原本捺印\\"、
+    「電子署名」とあれば\\"電子署名（CSRI発信）\\"。判断できなければnull",
+  "physical_mail_address": "締結方法が原本捺印と判断できる場合、投稿本文に
+    書かれている原本の送付先(郵便番号・住所・会社名・部署名・担当者名・
+    電話番号など)をそのままの文字列でまとめて抽出する。記載が無い/
+    該当しない場合はnull"
+}}
 """
 
 
@@ -138,21 +156,35 @@ def extract_docx_text(docx_bytes: bytes) -> str:
 # Gemini解析
 # =====================================================================
 
-def analyze_contract_with_gemini(*, pdf_bytes: bytes = None, text: str = None) -> dict:
-    """契約書(PDFバイナリ、またはWordから抽出済みのテキスト)をGeminiに渡し、
-    NDA判定を含む解析結果を得る。
+def analyze_contract_with_gemini(
+    *, pdf_bytes: bytes = None, text: str = None,
+    message_text: str = "", filename: str = "",
+    project_candidates: list = None,
+) -> dict:
+    """契約書(PDFバイナリ、またはWordから抽出済みのテキスト)に加えて、
+    Slack投稿本文・ファイル名・freeeのプロジェクト候補一覧もあわせてGeminiに渡し、
+    NDA判定と、freee申請に必要な項目(プロジェクト名/締結方法/原本送付先)の
+    自動抽出を1回のリクエストでまとめて行う。
     PDFはスキャン画像(テキスト層無し)でもGeminiが画像として読み取れるため
     OCR処理を別途行う必要がない。Wordは事前にテキスト抽出したものを渡す。
     """
+    prompt = build_nda_prompt(project_candidates or [])
+    extra_context = (
+        f"--- Slack投稿本文 ---\n{message_text or '(本文なし)'}\n\n"
+        f"--- 添付ファイル名 ---\n{filename}\n"
+    )
+
     if pdf_bytes is not None:
         contents = [
             types.Part.from_bytes(data=pdf_bytes, mime_type="application/pdf"),
-            NDA_ANALYSIS_PROMPT,
+            prompt,
+            extra_context,
         ]
     elif text is not None:
         contents = [
-            NDA_ANALYSIS_PROMPT,
-            f"\n--- 契約書本文(Wordファイルから抽出) ---\n{text}",
+            prompt,
+            extra_context,
+            f"--- 契約書本文(Wordファイルから抽出) ---\n{text}",
         ]
     else:
         raise ValueError("pdf_bytes または text のいずれかが必要です")
@@ -273,13 +305,14 @@ def upload_file_to_freee(file_bytes: bytes, filename: str) -> int:
 
 def create_nda_approval_request(
     *, title: str, counterparty: str, contract_date: str,
-    receipt_id: int, section_id: int, method: str,
+    receipt_id: int, section_id: int, method: str, mail_address: str = "",
 ) -> dict:
     """NDA契約締結申請(freeeの汎用申請フォーム)を作成する。
 
     request_itemsの並び・typeは、既存の承認済みNDA申請(form_id=87137)を
     参考に組み立てている。freee側でフォーム定義(項目の追加/削除/並び替え)
     が変更された場合はここも合わせて調整すること。
+    最初のmulti_lineは「原本送付先」欄(押印方法が原本捺印の場合のみ使用)。
     """
     body = {
         "company_id": FREEE_COMPANY_ID,
@@ -294,7 +327,7 @@ def create_nda_approval_request(
             {"type": "date", "value": contract_date},
             {"type": "receipt", "value": str(receipt_id)},
             {"type": "select", "value": method},
-            {"type": "multi_line", "value": ""},
+            {"type": "multi_line", "value": mail_address},
             {"type": "multi_line", "value": ""},
             {"type": "multi_line", "value": ""},
         ],
@@ -310,8 +343,45 @@ def create_nda_approval_request(
 
 
 # =====================================================================
-# Slack: 契約書ファイル受信 → Gemini解析 → NDA判定
+# Slack: 契約書ファイル受信 → Gemini解析 → NDA判定 → freee申請準備
 # =====================================================================
+
+def post_confirmation(pending: dict, thread_ts: str, say):
+    """freee申請の最終確認メッセージを投稿する"""
+    result = pending["gemini_result"]
+    lines = [
+        "以下の内容でfreeeにNDA契約締結申請を作成します。",
+        "よろしければこのメッセージに :+1: で反応してください。",
+        f"タイトル: {pending['filename']}",
+        f"契約当事者: {'、'.join(result.get('parties') or []) or '不明'}",
+        f"契約日: {result.get('contract_date') or '不明'}",
+        f"プロジェクト名: {pending['section_name']}",
+        f"締結方法: {pending['method']}",
+    ]
+    if pending.get("mail_address"):
+        lines.append(f"原本送付先: {pending['mail_address']}")
+    posted = say("\n".join(lines), thread_ts=thread_ts)
+    pending["confirm_message_ts"] = posted["ts"]
+    pending["stage"] = "awaiting_confirm"
+
+
+def prompt_for_missing_fields(missing_fields: list, thread_ts: str, say):
+    prompts = []
+    if "project_name" in missing_fields:
+        prompts.append("プロジェクト名: <プロジェクト名>")
+    if "method" in missing_fields:
+        prompts.append(f"締結方法: <{' か '.join(CONTRACT_METHODS)}>")
+    note = (
+        "\n(プロジェクトに紐づかない契約書は「CSRI」を指定してください)"
+        if "project_name" in missing_fields else ""
+    )
+    say(
+        "投稿内容・ファイル名・契約書の中身から自動判定を試みましたが、"
+        "次の項目が確認できませんでした。このスレッドで返信してください。\n"
+        f"`{' / '.join(prompts)}`" + note,
+        thread_ts=thread_ts,
+    )
+
 
 def handle_contract_files(event: dict, say):
     files = event.get("files", [])
@@ -321,6 +391,14 @@ def handle_contract_files(event: dict, say):
         return
 
     message_ts = event.get("ts")
+    message_text = event.get("text", "")
+
+    # プロジェクト名の自動判定に使う候補一覧(取得できなくても処理は続行する)
+    try:
+        project_candidates = [s.get("name") for s in fetch_freee_sections() if s.get("name")]
+    except Exception:
+        logger.exception("[freee] fetch sections failed (project候補取得)")
+        project_candidates = []
 
     for f in target_files:
         file_id = f.get("id")
@@ -338,7 +416,12 @@ def handle_contract_files(event: dict, say):
             if is_pdf_file(f):
                 page_count = get_pdf_page_count(raw_bytes)
                 logger.info(f"[PDF] sending to Gemini({GEMINI_MODEL}): {filename}")
-                result = analyze_contract_with_gemini(pdf_bytes=raw_bytes)
+                result = analyze_contract_with_gemini(
+                    pdf_bytes=raw_bytes,
+                    message_text=message_text,
+                    filename=filename,
+                    project_candidates=project_candidates,
+                )
                 meta_line = f"ページ数: {page_count}"
 
             else:  # docx
@@ -348,29 +431,59 @@ def handle_contract_files(event: dict, say):
                     say(f":warning: Wordファイルからテキストを抽出できませんでした: {filename}")
                     continue
                 logger.info(f"[DOCX] sending to Gemini({GEMINI_MODEL}): {filename}")
-                result = analyze_contract_with_gemini(text=text)
+                result = analyze_contract_with_gemini(
+                    text=text,
+                    message_text=message_text,
+                    filename=filename,
+                    project_candidates=project_candidates,
+                )
                 meta_line = f"文字数: {len(text)}"
 
             logger.info(f"[FILE] gemini result: {result}")
             say(format_analysis_message(filename, meta_line, result))
 
-            if result.get("is_nda"):
-                thread_ts = message_ts
-                _pending_nda[thread_ts] = {
-                    "filename": filename,
-                    "raw_bytes": raw_bytes,
-                    "gemini_result": result,
-                    "stage": "awaiting_fields",
-                }
-                say(
-                    text=(
-                        "freee申請作成のため、このスレッドで下記の形式で返信してください。\n"
-                        "(プロジェクトに紐づかない契約書は「CSRI」を指定してください)\n"
-                        f"`プロジェクト名: <プロジェクト名> / 締結方法: <{' か '.join(CONTRACT_METHODS)}>`\n"
-                        f"例: `プロジェクト名: CSRI / 締結方法: {CONTRACT_METHODS[0]}`"
-                    ),
-                    thread_ts=thread_ts,
-                )
+            if not result.get("is_nda"):
+                continue
+
+            thread_ts = message_ts
+
+            project_name = (result.get("project_name") or "").strip()
+            method = (result.get("method") or "").strip()
+            mail_address = (result.get("physical_mail_address") or "").strip()
+
+            section_id = None
+            if project_name:
+                try:
+                    section_id = find_section_id_by_name(project_name)
+                except Exception:
+                    logger.exception("[freee] fetch sections failed")
+                    section_id = None
+
+            missing_fields = []
+            if section_id is None:
+                missing_fields.append("project_name")
+                project_name = ""
+            if method not in CONTRACT_METHODS:
+                missing_fields.append("method")
+                method = ""
+
+            pending = {
+                "filename": filename,
+                "raw_bytes": raw_bytes,
+                "gemini_result": result,
+                "section_id": section_id,
+                "section_name": project_name,
+                "method": method,
+                "mail_address": mail_address if method == "原本捺印" else "",
+                "missing_fields": missing_fields,
+                "stage": "awaiting_fields" if missing_fields else "awaiting_confirm",
+            }
+            _pending_nda[thread_ts] = pending
+
+            if missing_fields:
+                prompt_for_missing_fields(missing_fields, thread_ts, say)
+            else:
+                post_confirmation(pending, thread_ts, say)
 
         except requests.HTTPError as e:
             logger.exception(f"[FILE] download failed: {filename}")
@@ -384,7 +497,8 @@ def handle_contract_files(event: dict, say):
 
 
 def handle_nda_field_reply(event: dict, say) -> bool:
-    """NDA申請の「プロジェクト名 / 締結方法」返信をスレッド内で処理する。
+    """NDA申請で不足している項目(プロジェクト名/締結方法)の返信を処理する。
+    片方だけの返信でも受け付け、揃うまで不足分だけを聞き返す。
     処理した場合True、対象外ならFalseを返す。
     """
     thread_ts = event.get("thread_ts")
@@ -393,58 +507,52 @@ def handle_nda_field_reply(event: dict, say) -> bool:
         return False
 
     text = event.get("text", "")
-    m = FIELD_REPLY_PATTERN.search(text)
-    if not m:
-        say(
-            "形式が読み取れませんでした。次の形式で返信してください。\n"
-            f"`プロジェクト名: <プロジェクト名> / 締結方法: <{' か '.join(CONTRACT_METHODS)}>`",
-            thread_ts=thread_ts,
-        )
+    missing = list(pending.get("missing_fields", []))
+
+    if "project_name" in missing:
+        m = PROJECT_REPLY_PATTERN.search(text)
+        if m:
+            section_name = m.group(1).strip()
+            try:
+                section_id = find_section_id_by_name(section_name)
+            except Exception as e:
+                logger.exception("[freee] fetch sections failed")
+                say(f":warning: freeeのプロジェクト一覧取得に失敗しました: {e}", thread_ts=thread_ts)
+                return True
+
+            if section_id is None:
+                say(
+                    f":warning: プロジェクト「{section_name}」がfreee上に見つかりません。"
+                    "freeeに登録されているプロジェクト名(部門名)と完全に一致させて返信してください"
+                    "(紐づかない場合は「CSRI」)。",
+                    thread_ts=thread_ts,
+                )
+                return True
+
+            pending["section_id"] = section_id
+            pending["section_name"] = section_name
+            missing.remove("project_name")
+
+    if "method" in missing:
+        m = METHOD_REPLY_PATTERN.search(text)
+        if m:
+            method = m.group(1).strip()
+            if method not in CONTRACT_METHODS:
+                say(
+                    f":warning: 締結方法は次のいずれかで指定してください: {', '.join(CONTRACT_METHODS)}",
+                    thread_ts=thread_ts,
+                )
+                return True
+            pending["method"] = method
+            missing.remove("method")
+
+    pending["missing_fields"] = missing
+
+    if missing:
+        prompt_for_missing_fields(missing, thread_ts, say)
         return True
 
-    section_name = m.group("section").strip()
-    method = m.group("method").strip()
-
-    if method not in CONTRACT_METHODS:
-        say(
-            f":warning: 締結方法は次のいずれかで指定してください: {', '.join(CONTRACT_METHODS)}",
-            thread_ts=thread_ts,
-        )
-        return True
-
-    try:
-        section_id = find_section_id_by_name(section_name)
-    except Exception as e:
-        logger.exception("[freee] fetch sections failed")
-        say(f":warning: freeeのプロジェクト一覧取得に失敗しました: {e}", thread_ts=thread_ts)
-        return True
-
-    if section_id is None:
-        say(
-            f":warning: プロジェクト「{section_name}」がfreee上に見つかりません。"
-            "freeeに登録されているプロジェクト名(部門名)と完全に一致させて返信してください"
-            "(紐づかない場合は「CSRI」)。",
-            thread_ts=thread_ts,
-        )
-        return True
-
-    pending["section_id"] = section_id
-    pending["section_name"] = section_name
-    pending["method"] = method
-    pending["stage"] = "awaiting_confirm"
-
-    result = pending["gemini_result"]
-    confirm_text = (
-        "以下の内容でfreeeにNDA契約締結申請を作成します。\n"
-        "よろしければこのメッセージに :+1: で反応してください。\n"
-        f"タイトル: {pending['filename']}\n"
-        f"契約当事者: {'、'.join(result.get('parties') or []) or '不明'}\n"
-        f"契約日: {result.get('contract_date') or '不明'}\n"
-        f"プロジェクト名: {section_name}\n"
-        f"締結方法: {method}"
-    )
-    posted = say(confirm_text, thread_ts=thread_ts)
-    pending["confirm_message_ts"] = posted["ts"]
+    post_confirmation(pending, thread_ts, say)
     return True
 
 
@@ -517,6 +625,7 @@ def handle_reaction_added(event, say, logger):
             receipt_id=receipt_id,
             section_id=pending["section_id"],
             method=pending["method"],
+            mail_address=pending.get("mail_address", ""),
         )
         say(
             f":white_check_mark: freeeへNDA契約締結申請を作成しました"

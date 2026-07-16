@@ -399,6 +399,7 @@ def create_nda_approval_request(
         "form_id": FREEE_NDA_FORM_ID,
         "approval_flow_route_id": FREEE_APPROVAL_FLOW_ROUTE_ID,
         "title": title,
+        "draft": False,  # false = 下書きではなく即申請する
         "request_items": [
             {"type": "title", "value": title},
             {"type": "section", "value": str(section_id)},

@@ -222,10 +222,16 @@ def analyze_contract_with_gemini(
     return json.loads(response.text)
 
 
+def format_parties(result: dict) -> str:
+    """Geminiが返すpartiesにNoneや空文字が混ざることがあるため除去してから結合する"""
+    parties = [p for p in (result.get("parties") or []) if p]
+    return "、".join(parties) or "不明"
+
+
 def format_analysis_message(filename: str, meta_line: str, result: dict) -> str:
     is_nda = result.get("is_nda")
     judgement = "✅ NDA(秘密保持契約)と判定" if is_nda else "❌ NDAではないと判定"
-    parties = "、".join(result.get("parties") or []) or "不明"
+    parties = format_parties(result)
     return (
         f"ファイルを受信しました: *{filename}* ({meta_line})\n"
         f"{judgement}\n"
@@ -436,7 +442,7 @@ def post_confirmation(pending: dict, thread_ts: str, say):
         "以下の内容でfreeeにNDA契約締結申請を作成します。",
         "よろしければこのメッセージに :+1: で反応してください。",
         f"タイトル: {pending['filename']}",
-        f"契約当事者: {'、'.join(result.get('parties') or []) or '不明'}",
+        f"契約当事者: {format_parties(result)}",
         f"契約日: {result.get('contract_date') or '不明'}",
         f"プロジェクト名: {pending['section_name']}"
         + ("(特定できなかったため自動設定。違う場合はfreee上で修正してください)"
@@ -706,7 +712,7 @@ def handle_reaction_added(event, say, logger):
         contract_title = os.path.splitext(pending["filename"])[0]
         approval = create_nda_approval_request(
             title=contract_title,
-            counterparty="、".join(result.get("parties") or []) or "不明",
+            counterparty=format_parties(result),
             contract_date=result.get("contract_date") or "",
             receipt_id=receipt_id,
             section_id=pending["section_id"],

@@ -394,7 +394,7 @@ def create_nda_approval_request(
     *, title: str, counterparty: str, contract_date: str,
     receipt_id: int, section_id: int, method: str, mail_address: str = "",
 ) -> dict:
-    """NDA契約締結申請(freeeの汎用申請フォーム, form_id=87137)を作成する。
+    """NDA契約締結申請(freeeの汎用申請フォーム, form_id=87137)を「下書き」として作成する。
 
     各項目には、freee側のフォーム定義に紐づく固定の`id`を指定する必要がある
     (`type`と`value`だけでは「Idを入力してください」というバリデーション
@@ -402,19 +402,18 @@ def create_nda_approval_request(
     ペイロード)から採取したもので、フォーム定義が変わらない限り固定。
     フォームの項目が追加/削除/並び替えされた場合はここも合わせて調整すること。
     最初のmulti_lineは「原本送付先」欄(押印方法が原本捺印の場合のみ使用)。
+
+    承認者(approver_id)は「申請」時に申請者が手動で選ぶ項目であり、
+    プロジェクトや契約内容から自動的に決まるものではないため、ここでは
+    指定しない(=下書きとして作成する)。最終的な承認者選択と「申請」ボタンの
+    クリックは、freee上で人が行う。
     """
     body = {
         "company_id": FREEE_COMPANY_ID,
         "form_id": FREEE_NDA_FORM_ID,
         "approval_flow_route_id": FREEE_APPROVAL_FLOW_ROUTE_ID,
         "title": title,
-        "draft": False,  # false = 下書きではなく即申請する
-        # ブラウザの下書き保存時のペイロードに合わせて明示的に含める
-        # (申請経路の解決にこれらのコンテキストが必要な可能性があるため)
-        "approver_id": None,
-        "group_id": None,
-        "applicant_group_id": None,
-        "observer_user_ids": [],
+        "draft": True,  # 承認者は人が選ぶ必要があるため下書きとして作成する
         "request_items": [
             {"id": 346116, "type": "title", "value": title},
             {"id": 57980, "type": "section", "value": str(section_id)},
@@ -729,8 +728,11 @@ def handle_reaction_added(event, say, logger):
             mail_address=pending.get("mail_address", ""),
         )
         say(
-            f":white_check_mark: freeeへNDA契約締結申請を作成しました"
-            f"(申請番号: {approval.get('application_number')})",
+            f":white_check_mark: freeeにNDA契約締結申請の下書きを作成しました"
+            f"(下書きID: {approval.get('id')} / タイトル: {contract_title})\n"
+            f"承認者の選択は人による判断が必要なため自動化していません。"
+            f"freeeにログインし、申請/自動精算 > 下書き一覧 から本申請を開き、"
+            f"承認者を選択して「申請」を押してください。",
             thread_ts=target_thread_ts,
         )
     except Exception as e:

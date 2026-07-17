@@ -43,7 +43,11 @@ FREEE_COMPANY_ID = int(os.environ["FREEE_COMPANY_ID"])
 FREEE_NDA_FORM_ID = int(os.environ.get("FREEE_NDA_FORM_ID", "87137"))
 # 「NDA契約締結申請」フォームの「申請経路の選択」に対応する必須項目。
 # NDA締結申請の経路(プロジェクトオーナー→リーガル(金子)→コーポレート(吉田))のID。
-FREEE_APPROVAL_FLOW_ROUTE_ID = int(os.environ.get("FREEE_APPROVAL_FLOW_ROUTE_ID", "1431338"))
+# 注意: 以前使っていた1431338は/api/1/approval_flow_routesで確認したところ
+# 「存在しないか既に削除された申請経路」だった。GET /api/1/approval_flow_routes
+# の一覧から、request_form_ids に87137(NDA申請フォーム)を含み、name="NDA締結申請"
+# の現在有効なIDである1430722に更新した。
+FREEE_APPROVAL_FLOW_ROUTE_ID = int(os.environ.get("FREEE_APPROVAL_FLOW_ROUTE_ID", "1430722"))
 # 認可コード取得時に指定したコールバックURLと同じ値を指定する
 # (ブラウザで手動取得した場合は "urn:ietf:wg:oauth:2.0:oob")
 FREEE_REDIRECT_URI = os.environ.get("FREEE_REDIRECT_URI", "urn:ietf:wg:oauth:2.0:oob")

@@ -841,6 +841,25 @@ def handle_message(event, say, logger):
             say(f":warning: 経路定義取得失敗: {e}")
         return
 
+    # 動作確認用コマンド: 現在有効な承認経路の一覧を取得する。
+    # FREEE_APPROVAL_FLOW_ROUTE_ID(1431338)が「存在しないか既に削除された」
+    # ことが!debug_routeで判明したため、現在使える経路IDを特定するために使う。
+    if text == "!debug_routes_list":
+        try:
+            resp = requests.get(
+                f"{FREEE_API_BASE}/api/1/approval_flow_routes",
+                headers=freee_headers("admin"),
+                params={"company_id": FREEE_COMPANY_ID},
+                timeout=30,
+            )
+            if not resp.ok:
+                say(f":warning: 経路一覧取得失敗: {resp.status_code} {resp.text}")
+            else:
+                say(f":mag: 経路一覧: {json.dumps(resp.json(), ensure_ascii=False)[:3000]}")
+        except Exception as e:
+            say(f":warning: 経路一覧取得失敗: {e}")
+        return
+
     # ファイル無しの通常メッセージ(動作確認用)
     say("イベント受信成功")
 

@@ -652,6 +652,13 @@ def handle_contract_files(event: dict, say):
             say(f":warning: ファイルの処理に失敗しました: {filename} ({e})")
 
 
+def strip_reply_chrome(s: str) -> str:
+    """返信からヒント文をそのままコピペした際に混入しがちな記号を除去する
+    (バッククォート `` ` `` や、ヒントの `<name>` 表記の山括弧など)。
+    """
+    return s.strip().strip("`<>「」\"'")
+
+
 def handle_nda_field_reply(event: dict, say) -> bool:
     """NDA申請で不足している項目(プロジェクト名/締結方法)の返信を処理する。
     片方だけの返信でも受け付け、揃うまで不足分だけを聞き返す。
@@ -668,7 +675,7 @@ def handle_nda_field_reply(event: dict, say) -> bool:
     if "project_name" in missing:
         m = PROJECT_REPLY_PATTERN.search(text)
         if m:
-            section_name = m.group(1).strip()
+            section_name = strip_reply_chrome(m.group(1))
             section_id = find_section_id_by_name(section_name)
 
             if section_id is None:
@@ -688,7 +695,7 @@ def handle_nda_field_reply(event: dict, say) -> bool:
     if "method" in missing:
         m = METHOD_REPLY_PATTERN.search(text)
         if m:
-            method = m.group(1).strip()
+            method = strip_reply_chrome(m.group(1))
             if method not in CONTRACT_METHODS:
                 say(
                     f":warning: 締結方法は次のいずれかで指定してください: {', '.join(CONTRACT_METHODS)}",
@@ -701,7 +708,7 @@ def handle_nda_field_reply(event: dict, say) -> bool:
     if "approver" in missing:
         m = APPROVER_REPLY_PATTERN.search(text)
         if m:
-            approver_name = m.group(1).strip()
+            approver_name = strip_reply_chrome(m.group(1))
             approver_id = find_approver_id_by_name(approver_name)
             logger.info(
                 f"[approver] 抽出した名前: {approver_name!r} "

@@ -30,7 +30,15 @@ CONTRACT_CHANNEL_ID = os.environ["CONTRACT_CHANNEL_ID"]
 # --- freee 設定 -------------------------------------------------------
 FREEE_CLIENT_ID = os.environ["FREEE_CLIENT_ID"]
 FREEE_CLIENT_SECRET = os.environ["FREEE_CLIENT_SECRET"]
+# 「申請者(金子さん)本人」としてのrefresh_token。承認経路(FREEE_APPROVAL_FLOW_ROUTE_ID)
+# が金子さんが申請者であることを前提にしているため、証憑アップロードと
+# 申請作成(create_nda_approval_request)は必ずこちらを使う。
 FREEE_REFRESH_TOKEN = os.environ["FREEE_REFRESH_TOKEN"]
+# (任意) 管理者権限を持つ別ユーザーのrefresh_token。sections/approval_flow_routes
+# など、金子さんのユーザー権限では読み取れないマスタ系APIの参照専用に使う。
+# 未設定の場合はFREEE_REFRESH_TOKEN(金子さん)にフォールバックする
+# (これまで通りuser_do_not_have_permissionになる可能性がある)。
+FREEE_ADMIN_REFRESH_TOKEN = os.environ.get("FREEE_ADMIN_REFRESH_TOKEN")
 FREEE_COMPANY_ID = int(os.environ["FREEE_COMPANY_ID"])
 FREEE_NDA_FORM_ID = int(os.environ.get("FREEE_NDA_FORM_ID", "87137"))
 # 「NDA契約締結申請」フォームの「申請経路の選択」に対応する必須項目。
@@ -281,32 +289,48 @@ def format_analysis_message(filename: str, meta_line: str, result: dict) -> str:
 # freee 連携
 # =====================================================================
 
-_freee_token_cache = {
-    "access_token": None,
-    "refresh_token": FREEE_REFRESH_TOKEN,
-    "expires_at": 0,
+# 2つのfreeeアイデンティティ(=それぞれ別のrefresh_token)を使い分ける。
+#   "user"  : 金子さん本人。証憑アップロードと申請作成(申請者本人が前提の
+#             承認経路を使うため)は必ずこちらを使う。
+#   "admin" : 管理者権限を持つ別ユーザー。sections/approval_flow_routesなど、
+#             金子さんの権限では読めないマスタ系APIの参照専用。
+#             FREEE_ADMIN_REFRESH_TOKEN未設定の場合は"user"にフォールバックする。
+_freee_token_caches = {
+    "user": {
+        "refresh_token": FREEE_REFRESH_TOKEN,
+        "render_env_key": "FREEE_REFRESH_TOKEN",
+        "access_token": None,
+        "expires_at": 0,
+    },
+    "admin": {
+        "refresh_token": FREEE_ADMIN_REFRESH_TOKEN or FREEE_REFRESH_TOKEN,
+        "render_env_key": "FREEE_ADMIN_REFRESH_TOKEN" if FREEE_ADMIN_REFRESH_TOKEN else "FREEE_REFRESH_TOKEN",
+        "access_token": None,
+        "expires_at": 0,
+    },
 }
 _sections_cache = None
 
 
-def get_freee_access_token() -> str:
-    """freeeのアクセストークンを取得する(必要な時だけrefresh)。
+def get_freee_access_token(identity: str = "user") -> str:
+    """freeeのアクセストークンを取得する(必要な時だけrefresh)。identityで
+    "user"(金子さん本人)か"admin"(管理者)のどちらのトークンを使うか選ぶ。
 
     重要な注意点: freeeのrefresh_tokenは使用するたびに新しい値に
     ローテーション(再発行)される。このプロセスはローテーション後の
     refresh_tokenをメモリ内にしか保持していないため、Renderのプロセスが
-    再起動すると環境変数FREEE_REFRESH_TOKENが指す値がすでに無効になっている
-    可能性がある。本番運用では、ローテーション後の値を外部ストレージ
-    (DB、Render環境変数のAPI経由更新、永続ディスク上のファイル等)に
-    保存する仕組みの追加を強く推奨する。
+    再起動すると環境変数が指す値がすでに無効になっている可能性がある。
+    そのためローテーション後の値は毎回Renderの環境変数に書き戻している
+    (persist_refresh_token_to_render)。
     """
+    cache = _freee_token_caches[identity]
     now = time.time()
-    if _freee_token_cache["access_token"] and now < _freee_token_cache["expires_at"] - 60:
-        return _freee_token_cache["access_token"]
+    if cache["access_token"] and now < cache["expires_at"] - 60:
+        return cache["access_token"]
 
     logger.info(
-        f"[freee] refreshing access token (redirect_uri={FREEE_REDIRECT_URI}, "
-        f"refresh_token末尾={_freee_token_cache['refresh_token'][-6:]})"
+        f"[freee:{identity}] refreshing access token (redirect_uri={FREEE_REDIRECT_URI}, "
+        f"refresh_token末尾={cache['refresh_token'][-6:]})"
     )
     resp = requests.post(
         FREEE_TOKEN_URL,
@@ -314,30 +338,30 @@ def get_freee_access_token() -> str:
             "grant_type": "refresh_token",
             "client_id": FREEE_CLIENT_ID,
             "client_secret": FREEE_CLIENT_SECRET,
-            "refresh_token": _freee_token_cache["refresh_token"],
+            "refresh_token": cache["refresh_token"],
             "redirect_uri": FREEE_REDIRECT_URI,
         },
         timeout=30,
     )
     if not resp.ok:
-        logger.error(f"[freee] token refresh failed: {resp.status_code} {resp.text}")
+        logger.error(f"[freee:{identity}] token refresh failed: {resp.status_code} {resp.text}")
     resp.raise_for_status()
     data = resp.json()
-    _freee_token_cache["access_token"] = data["access_token"]
-    _freee_token_cache["refresh_token"] = data["refresh_token"]
-    _freee_token_cache["expires_at"] = now + data["expires_in"]
-    logger.info("[freee] access token refreshed")
-    persist_refresh_token_to_render(data["refresh_token"])
-    return _freee_token_cache["access_token"]
+    cache["access_token"] = data["access_token"]
+    cache["refresh_token"] = data["refresh_token"]
+    cache["expires_at"] = now + data["expires_in"]
+    logger.info(f"[freee:{identity}] access token refreshed")
+    persist_refresh_token_to_render(cache["render_env_key"], data["refresh_token"])
+    return cache["access_token"]
 
 
-def persist_refresh_token_to_render(new_refresh_token: str):
-    """ローテーションされたrefresh_tokenをRenderの環境変数に書き戻す。
+def persist_refresh_token_to_render(env_key: str, new_refresh_token: str):
+    """ローテーションされたrefresh_tokenをRenderの環境変数(env_key)に書き戻す。
 
     これをしないと、プロセス再起動のたびに環境変数の古い(すでに使用済みの)
     refresh_tokenが読み込まれ、invalid_grantで失敗し続ける。
-    RENDER_API_KEY / RENDER_SERVICE_ID が未設定の場合は何もしない
-    (その場合は再起動のたびに手動での再認可が必要になる)。
+    RENDER_API_KEY / RENDER_SERVICE_ID が未設定の場合、またはenv_keyに対応する
+    環境変数がそもそも設定されていない場合(admin用トークン未使用時)は何もしない。
 
     注意: Renderの環境変数を更新すると、そのサービスは自動的に再デプロイ
     される。そのため、アクセストークンの更新(=このタイミング)のたびに
@@ -345,13 +369,13 @@ def persist_refresh_token_to_render(new_refresh_token: str):
     """
     if not RENDER_API_KEY or not RENDER_SERVICE_ID:
         logger.warning(
-            "[render] RENDER_API_KEY/RENDER_SERVICE_ID未設定のため、"
-            "refresh_tokenの永続化をスキップします(再起動すると失効する可能性があります)"
+            f"[render] RENDER_API_KEY/RENDER_SERVICE_ID未設定のため、"
+            f"{env_key}の永続化をスキップします(再起動すると失効する可能性があります)"
         )
         return
     try:
         resp = requests.put(
-            f"{RENDER_API_BASE}/services/{RENDER_SERVICE_ID}/env-vars/FREEE_REFRESH_TOKEN",
+            f"{RENDER_API_BASE}/services/{RENDER_SERVICE_ID}/env-vars/{env_key}",
             headers={
                 "Authorization": f"Bearer {RENDER_API_KEY}",
                 "Content-Type": "application/json",
@@ -362,13 +386,13 @@ def persist_refresh_token_to_render(new_refresh_token: str):
         if not resp.ok:
             logger.error(f"[render] env var update failed: {resp.status_code} {resp.text}")
             return
-        logger.info("[render] FREEE_REFRESH_TOKENをRenderに永続化しました")
+        logger.info(f"[render] {env_key}をRenderに永続化しました")
     except Exception:
-        logger.exception("[render] refresh_tokenの永続化に失敗しました")
+        logger.exception(f"[render] {env_key}の永続化に失敗しました")
 
 
-def freee_headers() -> dict:
-    return {"Authorization": f"Bearer {get_freee_access_token()}"}
+def freee_headers(identity: str = "user") -> dict:
+    return {"Authorization": f"Bearer {get_freee_access_token(identity)}"}
 
 
 def fetch_freee_sections() -> list:
@@ -385,7 +409,7 @@ def fetch_freee_sections() -> list:
         return _sections_cache
     resp = requests.get(
         f"{FREEE_API_BASE}/api/1/sections",
-        headers=freee_headers(),
+        headers=freee_headers("admin"),
         params={"company_id": FREEE_COMPANY_ID},
         timeout=30,
     )

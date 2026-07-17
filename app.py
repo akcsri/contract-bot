@@ -131,6 +131,30 @@ _NORMALIZED_KNOWN_APPROVERS = {normalize_name(k): v for k, v in KNOWN_APPROVERS.
 def find_approver_id_by_name(name: str):
     return _NORMALIZED_KNOWN_APPROVERS.get(normalize_name(name))
 
+
+# --- Slackユーザー → freeeユーザーID(申請者)の対応表 --------------------
+# freeeのNDA承認経路上は「申請者=freeeにログインしたユーザー」ではなく、
+# APIリクエストのapplicant_idフィールドで独立に指定できることが、実際に
+# 作成済みの申請(id: 9376018)をGET /api/1/approval_requests/{id}で確認した
+# ところ判明した。そのため、Slackで投稿した人がAkihiko(金子)さん以外でも、
+# 金子さん(または管理者)のfreeeトークンでAPIを呼び出したまま、
+# applicant_idだけをSlack投稿者に応じて切り替えれば、投稿者本人に
+# 個別のfreee OAuth認可をしてもらう必要が無いはず(要実地検証)。
+#
+# 新しいSlackユーザーを追加する方法:
+#   1. Slackプロフィールの「その他」→「メンバーIDをコピー」でSlackユーザーID
+#      (例: U07PUQG9NNQ)を確認する
+#   2. freeeにログインし、「設定」→「メンバー管理」で対象者のプロフィールを開き
+#      ユーザーIDを確認する(またはKNOWN_APPROVERSと同様にDevTools等で調べる)
+#   3. 下の辞書に {"<SlackユーザーID>": <freeeユーザーID>} を追記する
+KNOWN_FREEE_USERS = {
+    "U07PUQG9NNQ": 13323251,  # 金子明彦
+}
+
+
+def find_applicant_id_by_slack_user(slack_user_id: str):
+    return KNOWN_FREEE_USERS.get(slack_user_id)
+
 PDF_MIMETYPES = {"application/pdf"}
 PDF_FILETYPES = {"pdf"}
 DOCX_MIMETYPES = {
@@ -161,7 +185,15 @@ Slack投稿の本文とファイル名も参考情報として渡されます。
 {{
   "is_nda": true または false (秘密保持契約/NDAであればtrue),
   "document_type": "書類の種類(例: 秘密保持契約書, 業務委託契約書 等)",
+  "document_title": "契約書の冒頭(表紙・見出し部分)に実際に印字されている
+    契約書名をそのままの文字列で抽出する(例: '守秘義務に関する確約書'。
+    書類種別の一般的な分類ではなく、その書類に実際に書かれている
+    タイトルの表記そのものを優先する)。読み取れない場合はnull",
   "parties": ["契約当事者1", "契約当事者2"],
+  "counterparty_name": "契約当事者のうち、株式会社企業支援総合研究所(CSRI)
+    ではない側(相手方)の正式な会社名または氏名を、契約書に記載されている
+    通りの表記で1つだけ抽出する。当事者名にプレースホルダー(●●、対象会社
+    など)しか無く実名が分からない場合や、相手方が判別できない場合はnull",
   "contract_date": "YYYY-MM-DD形式の契約日。読み取れない場合はnull",
   "reason": "is_ndaと判定した理由の要約(1〜2文)",
   "project_name": "次の候補の中から一致するものを1つだけ選んで文字列で返す: [{candidates_text}]。
@@ -437,6 +469,59 @@ def find_section_id_by_name(name: str):
     return KNOWN_PROJECT_SECTION_IDS.get(name)
 
 
+def find_partner_id_by_name(name: str):
+    """相手方の会社名/氏名から、既存のfreee取引先(partners)を検索してIDを返す。
+
+    現在のアプリのOAuthスコープにaccounting:partners:readが含まれていない
+    可能性があり、その場合は403/401になる。その場合は例外を握りつぶして
+    Noneを返し、呼び出し元で「会社名をそのまま記入する」フォールバックを
+    使う(取引先マスタへの読み取り権限が付与されれば自動的に使われるように
+    しておく)。
+    """
+    if not name:
+        return None
+    try:
+        resp = requests.get(
+            f"{FREEE_API_BASE}/api/1/partners",
+            headers=freee_headers("user"),
+            params={"company_id": FREEE_COMPANY_ID, "keyword": name},
+            timeout=15,
+        )
+        if not resp.ok:
+            logger.warning(
+                f"[freee] 取引先検索に失敗(スコープ不足の可能性、名前で代用します): "
+                f"{resp.status_code} {resp.text}"
+            )
+            return None
+        partners = resp.json().get("partners", [])
+        for p in partners:
+            if p.get("name") == name:
+                return p.get("id")
+        for p in partners:
+            pname = p.get("name") or ""
+            if name in pname or pname in name:
+                return p.get("id")
+        return None
+    except Exception:
+        logger.exception("[freee] 取引先検索でエラーが発生しました(名前で代用します)")
+        return None
+
+
+def resolve_partner_field_value(counterparty_name: str) -> str:
+    """相手方欄(request_itemsのtype=partner)に入れる値を決める。
+    既存の取引先に一致するものがあればそのID、無ければ会社名/氏名の
+    文字列そのものをそのまま使う。
+    """
+    if not counterparty_name:
+        return ""
+    partner_id = find_partner_id_by_name(counterparty_name)
+    if partner_id is not None:
+        logger.info(f"[freee] 取引先「{counterparty_name}」を既存の取引先ID {partner_id} に解決しました")
+        return str(partner_id)
+    logger.info(f"[freee] 取引先「{counterparty_name}」に一致する既存取引先が無いため、名前をそのまま使用します")
+    return counterparty_name
+
+
 def upload_file_to_freee(file_bytes: bytes, filename: str) -> int:
     """freeeのファイルボックス(証憑)にアップロードし、receipt idを返す"""
     resp = requests.post(
@@ -453,9 +538,9 @@ def upload_file_to_freee(file_bytes: bytes, filename: str) -> int:
 
 
 def create_nda_approval_request(
-    *, title: str, counterparty: str, contract_date: str,
+    *, title: str, contract_date: str,
     receipt_id: int, section_id: int, method: str, approver_id: int,
-    mail_address: str = "",
+    applicant_id: int = None, partner_value: str = "", mail_address: str = "",
 ) -> dict:
     """NDA契約締結申請(freeeの汎用申請フォーム, form_id=87137)を作成し、申請する。
 
@@ -472,6 +557,13 @@ def create_nda_approval_request(
     このIDはnull/省略のどちらでも「利用できない申請経路IDが指定されています」
     「approver_idはnullを指定することはできません」というエラーになることを
     確認済みで、実際に有効なユーザーIDを指定する必要がある。
+
+    申請者(applicant_id)は、APIを呼び出すfreeeアカウント(=このプロセスの
+    OAuthトークンの持ち主。常に金子さん)とは独立に指定できる項目。
+    GET /api/1/approval_requests/{id}でレスポンスにapplicant_idフィールドが
+    含まれていることを確認済みで、Slack投稿者(KNOWN_FREEE_USERSで解決)を
+    ここに渡すことで、金子さん以外が投稿した場合でも投稿者本人名義で
+    申請できるようにする(要実地検証)。
     """
     body = {
         "company_id": FREEE_COMPANY_ID,
@@ -480,6 +572,7 @@ def create_nda_approval_request(
         "title": title,
         "draft": False,  # 承認者が判明しているため、下書きではなく即申請する
         "approver_id": approver_id,
+        "applicant_id": applicant_id,
         # group_id/applicant_group_id/observer_user_idsはnullでも明示的に含めないと
         # approval_flow_route_idが不正というエラーになることを確認済み。
         "group_id": None,
@@ -488,8 +581,8 @@ def create_nda_approval_request(
         "request_items": [
             {"id": 346116, "type": "title", "value": title},
             {"id": 57980, "type": "section", "value": str(section_id)},
-            {"id": 789358, "type": "single_line", "value": counterparty},
-            {"id": 32070, "type": "partner", "value": ""},
+            {"id": 789358, "type": "single_line", "value": ""},
+            {"id": 32070, "type": "partner", "value": partner_value},
             {"id": 293716, "type": "date", "value": contract_date},
             {"id": 555747, "type": "receipt", "value": str(receipt_id)},
             {"id": 647567, "type": "select", "value": method},
@@ -517,17 +610,28 @@ def create_nda_approval_request(
 def post_confirmation(pending: dict, thread_ts: str, say):
     """freee申請の最終確認メッセージを投稿する"""
     result = pending["gemini_result"]
+    contract_title = (
+        (result.get("document_title") or "").strip()
+        or (result.get("document_type") or "").strip()
+        or os.path.splitext(pending["filename"])[0]
+    )
+    counterparty_name = (result.get("counterparty_name") or "").strip() or format_parties(result)
     lines = [
         "以下の内容でfreeeにNDA契約締結申請を行います。",
         "よろしければこのメッセージに :+1: で反応してください。",
-        f"タイトル: {pending['filename']}",
+        f"タイトル: {contract_title}",
         f"契約当事者: {format_parties(result)}",
+        f"相手方(取引先欄): {counterparty_name}",
         f"契約日: {result.get('contract_date') or '不明'}",
         f"プロジェクト名: {pending['section_name']}"
         + ("(特定できなかったため自動設定。違う場合はfreee上で修正してください)"
            if pending.get("project_auto_defaulted") else ""),
         f"締結方法: {pending['method']}",
         f"承認者: {pending['approver_name']}",
+        f"申請者: freeeユーザーID {pending['applicant_id']}"
+        + ("(投稿者未登録のため金子明彦名義で申請されます。KNOWN_FREEE_USERSに"
+           "登録すると投稿者ご本人名義になります)"
+           if pending.get("applicant_auto_defaulted") else ""),
     ]
     if pending.get("mail_address"):
         lines.append(f"原本送付先: {pending['mail_address']}")
@@ -566,6 +670,7 @@ def handle_contract_files(event: dict, say):
 
     message_ts = event.get("ts")
     message_text = event.get("text", "")
+    posting_slack_user_id = event.get("user")
 
     # プロジェクト名の自動判定に使う候補一覧(KNOWN_PROJECT_SECTION_IDSより)
     project_candidates = get_project_candidates()
@@ -648,6 +753,14 @@ def handle_contract_files(event: dict, say):
             # 毎回Slackスレッドで確認する(自動判定・自動デフォルトはしない)。
             missing_fields.append("approver")
 
+            # 申請者(applicant_id)はSlack投稿者に対応するfreeeユーザーID。
+            # 未登録の場合は金子さん名義にフォールバックし、確認メッセージで
+            # その旨を明示する(申請自体は失敗させない)。
+            applicant_id = find_applicant_id_by_slack_user(posting_slack_user_id)
+            applicant_auto_defaulted = applicant_id is None
+            if applicant_id is None:
+                applicant_id = KNOWN_FREEE_USERS.get("U07PUQG9NNQ")  # 金子明彦にフォールバック
+
             pending = {
                 "filename": filename,
                 "raw_bytes": raw_bytes,
@@ -659,6 +772,9 @@ def handle_contract_files(event: dict, say):
                 "mail_address": mail_address if method == "原本捺印" else "",
                 "approver_id": None,
                 "approver_name": "",
+                "posting_slack_user_id": posting_slack_user_id,
+                "applicant_id": applicant_id,
+                "applicant_auto_defaulted": applicant_auto_defaulted,
                 "missing_fields": missing_fields,
                 "stage": "awaiting_fields" if missing_fields else "awaiting_confirm",
             }
@@ -907,16 +1023,32 @@ def handle_reaction_added(event, say, logger):
 
         result = pending["gemini_result"]
         logger.info(f"[freee] creating approval request: {pending['filename']}")
-        contract_title = os.path.splitext(pending["filename"])[0]
+        # タイトルは契約書に実際に印字されている表題を優先し、
+        # 読み取れなければ書類種別、それも無ければファイル名にフォールバックする。
+        contract_title = (
+            (result.get("document_title") or "").strip()
+            or (result.get("document_type") or "").strip()
+            or os.path.splitext(pending["filename"])[0]
+        )
+        # 相手方は、既存のfreee取引先に一致するものがあればそのID、
+        # 無ければ契約書に記載された正式名称の文字列をそのまま使う。
+        counterparty_name = (result.get("counterparty_name") or "").strip()
+        partner_value = resolve_partner_field_value(counterparty_name)
+        logger.info(f"[freee] タイトル: {contract_title!r} / 相手方欄の値: {partner_value!r}")
         approval = create_nda_approval_request(
             title=contract_title,
-            counterparty=format_parties(result),
             contract_date=result.get("contract_date") or datetime.date.today().isoformat(),
             receipt_id=receipt_id,
             section_id=pending["section_id"],
             method=pending["method"],
             approver_id=pending["approver_id"],
+            applicant_id=pending.get("applicant_id"),
+            partner_value=partner_value,
             mail_address=pending.get("mail_address", ""),
+        )
+        logger.info(
+            f"[freee] 申請完了。applicant_id指定値: {pending.get('applicant_id')} / "
+            f"レスポンスのapplicant_id: {approval.get('applicant_id')}"
         )
         say(
             f":white_check_mark: freeeへNDA契約締結申請を行いました"

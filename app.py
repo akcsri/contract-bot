@@ -110,8 +110,15 @@ KNOWN_PROJECT_SECTION_IDS = {
 #   2. もしくは実際にfreee上でその人を承認者に選んで「申請」を押す際の
 #      ブラウザDevTools上のリクエストペイロードに approver_id として現れる値を使う
 #   3. その<ID>と承認者名をこの辞書に追記する
+#
+# 注意: freeeにはHR(人事労務)側のemployee_idと会計側のuser_idという
+# 別の採番体系が存在する(例: 金子明彦はemployee_id=3629707, user_id=13323251)。
+# ここに登録するのは必ず会計側のuser_id(申請/承認APIで使われる方)。
 KNOWN_APPROVERS = {
     "金子明彦": 13323251,
+    # NDA締結申請の承認経路(プロジェクトオーナー→リーガル(金子)→コーポレート(吉田))の
+    # 「コーポレート」ステップのuser_idから判明(要最終確認)。
+    "吉田愛美": 13233207,
 }
 
 
@@ -149,6 +156,7 @@ def find_approver_id_by_name(name: str):
 #   3. 下の辞書に {"<SlackユーザーID>": <freeeユーザーID>} を追記する
 KNOWN_FREEE_USERS = {
     "U07PUQG9NNQ": 13323251,  # 金子明彦
+    "U06MND3BB6E": 13233207,  # 吉田愛美(要最終確認。NDA経路のコーポレートステップより)
 }
 
 
@@ -305,6 +313,24 @@ def format_parties(result: dict) -> str:
     """Geminiが返すpartiesにNoneや空文字が混ざることがあるため除去してから結合する"""
     parties = [p for p in (result.get("parties") or []) if p]
     return "、".join(parties) or "不明"
+
+
+# 自社名(取引先扱いにしないためのフィルタ)
+OWN_COMPANY_NAMES = {"株式会社企業支援総合研究所", "CSRI"}
+
+
+def resolve_counterparty_name(result: dict) -> str:
+    """相手方の名称を決める。Geminiがcounterparty_nameを特定できなかった場合
+    (プレースホルダーの契約書ひな形など)は、partiesのうち自社以外の
+    記載をフォールバックとして使う(取引先欄を空のまま申請すると
+    「取引先が入力されていません」というエラーになるため、名前が
+    プレースホルダーだとしても何かしら入れておく)。
+    """
+    name = (result.get("counterparty_name") or "").strip()
+    if name:
+        return name
+    parties = [p for p in (result.get("parties") or []) if p and p not in OWN_COMPANY_NAMES]
+    return parties[0] if parties else ""
 
 
 def format_analysis_message(filename: str, meta_line: str, result: dict) -> str:
@@ -507,19 +533,27 @@ def find_partner_id_by_name(name: str):
         return None
 
 
-def resolve_partner_field_value(counterparty_name: str) -> str:
-    """相手方欄(request_itemsのtype=partner)に入れる値を決める。
-    既存の取引先に一致するものがあればそのID、無ければ会社名/氏名の
-    文字列そのものをそのまま使う。
+def resolve_counterparty_fields(counterparty_name: str) -> tuple:
+    """相手方に関する2つの欄の値を決める。
+
+    フォーム定義(GET /api/1/approval_requests/forms/87137)によると、
+    id 32070(type: partner, ラベル「契約相手方（既存取引先）」)と
+    id 789358(type: single_line, ラベル「契約相手方（新規取引先）」)は、
+    どちらか一方に入力する二者択一の項目(両方空だと
+    「取引先が入力されていません」というエラーになることを確認済み)。
+    既存の取引先に一致するものがあればそのIDをpartner欄に、
+    無ければ会社名/氏名の文字列をsingle_line(新規取引先)欄に入れる。
+
+    戻り値: (partner_value, single_line_value)
     """
     if not counterparty_name:
-        return ""
+        return "", ""
     partner_id = find_partner_id_by_name(counterparty_name)
     if partner_id is not None:
         logger.info(f"[freee] 取引先「{counterparty_name}」を既存の取引先ID {partner_id} に解決しました")
-        return str(partner_id)
-    logger.info(f"[freee] 取引先「{counterparty_name}」に一致する既存取引先が無いため、名前をそのまま使用します")
-    return counterparty_name
+        return str(partner_id), ""
+    logger.info(f"[freee] 取引先「{counterparty_name}」に一致する既存取引先が無いため、新規取引先名として使用します")
+    return "", counterparty_name
 
 
 def upload_file_to_freee(file_bytes: bytes, filename: str) -> int:
@@ -540,7 +574,8 @@ def upload_file_to_freee(file_bytes: bytes, filename: str) -> int:
 def create_nda_approval_request(
     *, title: str, contract_date: str,
     receipt_id: int, section_id: int, method: str, approver_id: int,
-    applicant_id: int = None, partner_value: str = "", mail_address: str = "",
+    applicant_id: int = None, partner_value: str = "", new_partner_name: str = "",
+    mail_address: str = "",
 ) -> dict:
     """NDA契約締結申請(freeeの汎用申請フォーム, form_id=87137)を作成し、申請する。
 
@@ -581,7 +616,7 @@ def create_nda_approval_request(
         "request_items": [
             {"id": 346116, "type": "title", "value": title},
             {"id": 57980, "type": "section", "value": str(section_id)},
-            {"id": 789358, "type": "single_line", "value": ""},
+            {"id": 789358, "type": "single_line", "value": new_partner_name},
             {"id": 32070, "type": "partner", "value": partner_value},
             {"id": 293716, "type": "date", "value": contract_date},
             {"id": 555747, "type": "receipt", "value": str(receipt_id)},
@@ -615,7 +650,7 @@ def post_confirmation(pending: dict, thread_ts: str, say):
         or (result.get("document_type") or "").strip()
         or os.path.splitext(pending["filename"])[0]
     )
-    counterparty_name = (result.get("counterparty_name") or "").strip() or format_parties(result)
+    counterparty_name = resolve_counterparty_name(result) or "不明"
     lines = [
         "以下の内容でfreeeにNDA契約締結申請を行います。",
         "よろしければこのメッセージに :+1: で反応してください。",
@@ -1051,11 +1086,14 @@ def handle_reaction_added(event, say, logger):
             or (result.get("document_type") or "").strip()
             or os.path.splitext(pending["filename"])[0]
         )
-        # 相手方は、既存のfreee取引先に一致するものがあればそのID、
-        # 無ければ契約書に記載された正式名称の文字列をそのまま使う。
-        counterparty_name = (result.get("counterparty_name") or "").strip()
-        partner_value = resolve_partner_field_value(counterparty_name)
-        logger.info(f"[freee] タイトル: {contract_title!r} / 相手方欄の値: {partner_value!r}")
+        # 相手方は、既存のfreee取引先に一致するものがあればそのID(partner欄)、
+        # 無ければ契約書に記載された正式名称を新規取引先名(single_line欄)として使う。
+        counterparty_name = resolve_counterparty_name(result)
+        partner_value, new_partner_name = resolve_counterparty_fields(counterparty_name)
+        logger.info(
+            f"[freee] タイトル: {contract_title!r} / 相手方名: {counterparty_name!r} / "
+            f"partner欄: {partner_value!r} / 新規取引先欄: {new_partner_name!r}"
+        )
         approval = create_nda_approval_request(
             title=contract_title,
             contract_date=result.get("contract_date") or datetime.date.today().isoformat(),
@@ -1065,6 +1103,7 @@ def handle_reaction_added(event, say, logger):
             approver_id=pending["approver_id"],
             applicant_id=pending.get("applicant_id"),
             partner_value=partner_value,
+            new_partner_name=new_partner_name,
             mail_address=pending.get("mail_address", ""),
         )
         logger.info(

@@ -697,7 +697,10 @@ def handle_message(event, say, logger):
 @app.event("reaction_added")
 def handle_reaction_added(event, say, logger):
     """確認メッセージへのリアクションでfreee申請を実行する"""
+    logger.info(f"========== REACTION EVENT RECEIVED: {event} ==========")
+
     if event.get("reaction") not in APPROVE_REACTIONS:
+        logger.info(f"[reaction] 対象外のリアクションのため無視: {event.get('reaction')}")
         return
 
     item = event.get("item", {})
@@ -705,7 +708,11 @@ def handle_reaction_added(event, say, logger):
 
     # 指定チャンネル以外は無視(テスト/本番の切り分け)
     if item.get("channel") != CONTRACT_CHANNEL_ID:
+        logger.info(f"[reaction] 対象外チャンネルのため無視: {item.get('channel')}")
         return
+
+    logger.info(f"[reaction] 現在のpending件数: {len(_pending_nda)}, 検索対象message_ts: {message_ts}")
+    logger.info(f"[reaction] pending一覧: { {k: v.get('confirm_message_ts') for k, v in _pending_nda.items()} }")
 
     target_thread_ts = None
     for thread_ts, pending in _pending_nda.items():
@@ -714,6 +721,8 @@ def handle_reaction_added(event, say, logger):
             break
 
     if target_thread_ts is None:
+        logger.warning(f"[reaction] 対応するpendingが見つかりません(message_ts={message_ts})。"
+                        f"再デプロイ等でメモリ上の状態が失われた可能性があります。")
         return
 
     pending = _pending_nda.pop(target_thread_ts)

@@ -803,6 +803,44 @@ def handle_message(event, say, logger):
             say(f":warning: sections取得失敗: {e}")
         return
 
+    # 動作確認用コマンド: NDA申請フォーム(87137)自体の定義を取得する。
+    # 「利用できない申請経路IDが指定されています」の原因調査用。
+    # accounting:approval_requests:read スコープは既に付与済みのはずなので、
+    # 金子さん本人のトークン("user")でアクセスできるはず。
+    if text == "!debug_form":
+        try:
+            resp = requests.get(
+                f"{FREEE_API_BASE}/api/1/approval_requests/forms/{FREEE_NDA_FORM_ID}",
+                headers=freee_headers("user"),
+                params={"company_id": FREEE_COMPANY_ID},
+                timeout=30,
+            )
+            if not resp.ok:
+                say(f":warning: フォーム定義取得失敗: {resp.status_code} {resp.text}")
+            else:
+                say(f":mag: フォーム定義: {json.dumps(resp.json(), ensure_ascii=False)[:3000]}")
+        except Exception as e:
+            say(f":warning: フォーム定義取得失敗: {e}")
+        return
+
+    # 動作確認用コマンド: 承認経路(1431338)自体の定義を取得する
+    # (どの承認者/グループが正しいステップとして期待されているかを確認する)。
+    if text == "!debug_route":
+        try:
+            resp = requests.get(
+                f"{FREEE_API_BASE}/api/1/approval_flow_routes/{FREEE_APPROVAL_FLOW_ROUTE_ID}",
+                headers=freee_headers("admin"),
+                params={"company_id": FREEE_COMPANY_ID},
+                timeout=30,
+            )
+            if not resp.ok:
+                say(f":warning: 経路定義取得失敗: {resp.status_code} {resp.text}")
+            else:
+                say(f":mag: 経路定義: {json.dumps(resp.json(), ensure_ascii=False)[:3000]}")
+        except Exception as e:
+            say(f":warning: 経路定義取得失敗: {e}")
+        return
+
     # ファイル無しの通常メッセージ(動作確認用)
     say("イベント受信成功")
 

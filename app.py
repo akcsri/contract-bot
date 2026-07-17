@@ -961,6 +961,26 @@ def handle_message(event, say, logger):
             say(f":warning: 経路定義取得失敗: {e}")
         return
 
+    # 動作確認用コマンド: 事業所のメンバー一覧(freeeユーザーID込み)を取得する。
+    # KNOWN_FREEE_USERS(Slackユーザー→freeeユーザーIDの対応表)に新しい人を
+    # 追加する際、本人にfreee上のユーザーIDを確認してもらわなくても
+    # ここから調べられるかを確認するためのもの。
+    if text == "!debug_users":
+        try:
+            resp = requests.get(
+                f"{FREEE_API_BASE}/api/1/users",
+                headers=freee_headers("admin"),
+                params={"company_id": FREEE_COMPANY_ID},
+                timeout=30,
+            )
+            if not resp.ok:
+                say(f":warning: メンバー一覧取得失敗: {resp.status_code} {resp.text}")
+            else:
+                say(f":mag: メンバー一覧: {json.dumps(resp.json(), ensure_ascii=False)[:3000]}")
+        except Exception as e:
+            say(f":warning: メンバー一覧取得失敗: {e}")
+        return
+
     # 動作確認用コマンド: 現在有効な承認経路の一覧を取得する。
     # FREEE_APPROVAL_FLOW_ROUTE_ID(1431338)が「存在しないか既に削除された」
     # ことが!debug_routeで判明したため、現在使える経路IDを特定するために使う。

@@ -913,7 +913,8 @@ def handle_message(event, say, logger):
 
     # 動作確認用コマンド: 権限が変わったfreeeトークンでsections/approval_flow_routes
     # が読めるようになったかを直接確認する(下書きコード内のfetch_freee_sectionsを使用)。
-    text = (event.get("text") or "").strip()
+    # コピペ時にバッククォート等が混入しても一致するよう正規化してから比較する。
+    text = strip_reply_chrome(event.get("text") or "")
     if text == "!debug_sections":
         try:
             sections = fetch_freee_sections()

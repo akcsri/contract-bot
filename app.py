@@ -86,6 +86,21 @@ KNOWN_PROJECT_SECTION_IDS = {
     "アバウテック": 3247109,
 }
 
+# --- 承認者名 → freeeユーザーID の対応表 -------------------------------
+# 承認者は完全に人の判断による選択であり、プロジェクトや契約内容からは
+# 自動的に決まらないため、Slackスレッドで都度名前を確認し、この対応表で
+# freeeのユーザーIDに変換してから申請する。
+#
+# 新しい承認者のIDを調べる方法:
+#   1. freeeにログインし、「設定」→「メンバー管理」で対象者のプロフィールを開く、
+#      または対象者自身にfreeeの自分のユーザーIDを確認してもらう
+#   2. もしくは実際にfreee上でその人を承認者に選んで「申請」を押す際の
+#      ブラウザDevTools上のリクエストペイロードに approver_id として現れる値を使う
+#   3. その<ID>と承認者名をこの辞書に追記する
+KNOWN_APPROVERS = {
+    "金子明彦": 13323251,
+}
+
 PDF_MIMETYPES = {"application/pdf"}
 PDF_FILETYPES = {"pdf"}
 DOCX_MIMETYPES = {
@@ -96,6 +111,7 @@ DOCX_FILETYPES = {"docx"}
 # 不足項目を聞き返すときに使う個別パターン(どちらか一方だけの返信でも拾える)
 PROJECT_REPLY_PATTERN = re.compile(r"プロジェクト名?[:：]\s*(\S+)")
 METHOD_REPLY_PATTERN = re.compile(r"締結方法[:：]\s*(.+)")
+APPROVER_REPLY_PATTERN = re.compile(r"承認者[:：]\s*(\S+)")
 
 
 def build_nda_prompt(project_candidates: list) -> str:
@@ -392,9 +408,10 @@ def upload_file_to_freee(file_bytes: bytes, filename: str) -> int:
 
 def create_nda_approval_request(
     *, title: str, counterparty: str, contract_date: str,
-    receipt_id: int, section_id: int, method: str, mail_address: str = "",
+    receipt_id: int, section_id: int, method: str, approver_id: int,
+    mail_address: str = "",
 ) -> dict:
-    """NDA契約締結申請(freeeの汎用申請フォーム, form_id=87137)を「下書き」として作成する。
+    """NDA契約締結申請(freeeの汎用申請フォーム, form_id=87137)を作成し、申請する。
 
     各項目には、freee側のフォーム定義に紐づく固定の`id`を指定する必要がある
     (`type`と`value`だけでは「Idを入力してください」というバリデーション
@@ -403,21 +420,22 @@ def create_nda_approval_request(
     フォームの項目が追加/削除/並び替えされた場合はここも合わせて調整すること。
     最初のmulti_lineは「原本送付先」欄(押印方法が原本捺印の場合のみ使用)。
 
-    承認者(approver_id)は「申請」時に申請者が手動で選ぶ項目であり、
-    プロジェクトや契約内容から自動的に決まるものではないため、ここでは
-    指定しない(=下書きとして作成する)。最終的な承認者選択と「申請」ボタンの
-    クリックは、freee上で人が行う。
+    承認者(approver_id)はプロジェクトや契約内容から自動的に決まるものではなく
+    完全に人の判断による選択のため、Slackスレッドで都度確認し
+    (KNOWN_APPROVERSで名前→IDに変換したうえで)呼び出し元から渡す。
+    このIDはnull/省略のどちらでも「利用できない申請経路IDが指定されています」
+    「approver_idはnullを指定することはできません」というエラーになることを
+    確認済みで、実際に有効なユーザーIDを指定する必要がある。
     """
     body = {
         "company_id": FREEE_COMPANY_ID,
         "form_id": FREEE_NDA_FORM_ID,
         "approval_flow_route_id": FREEE_APPROVAL_FLOW_ROUTE_ID,
         "title": title,
-        "draft": True,  # 承認者は人が選ぶ必要があるため下書きとして作成する
+        "draft": False,  # 承認者が判明しているため、下書きではなく即申請する
+        "approver_id": approver_id,
         # group_id/applicant_group_id/observer_user_idsはnullでも明示的に含めないと
         # approval_flow_route_idが不正というエラーになることを確認済み。
-        # 一方approver_idは「キー自体を省略」しないとエラーになる
-        # (null不可、かつ下書きでは値も決まっていないため)。
         "group_id": None,
         "applicant_group_id": None,
         "observer_user_ids": [],
@@ -454,7 +472,7 @@ def post_confirmation(pending: dict, thread_ts: str, say):
     """freee申請の最終確認メッセージを投稿する"""
     result = pending["gemini_result"]
     lines = [
-        "以下の内容でfreeeにNDA契約締結申請を作成します。",
+        "以下の内容でfreeeにNDA契約締結申請を行います。",
         "よろしければこのメッセージに :+1: で反応してください。",
         f"タイトル: {pending['filename']}",
         f"契約当事者: {format_parties(result)}",
@@ -463,6 +481,7 @@ def post_confirmation(pending: dict, thread_ts: str, say):
         + ("(特定できなかったため自動設定。違う場合はfreee上で修正してください)"
            if pending.get("project_auto_defaulted") else ""),
         f"締結方法: {pending['method']}",
+        f"承認者: {pending['approver_name']}",
     ]
     if pending.get("mail_address"):
         lines.append(f"原本送付先: {pending['mail_address']}")
@@ -477,13 +496,16 @@ def prompt_for_missing_fields(missing_fields: list, thread_ts: str, say):
         prompts.append("プロジェクト名: <プロジェクト名>")
     if "method" in missing_fields:
         prompts.append(f"締結方法: <{' か '.join(CONTRACT_METHODS)}>")
+    if "approver" in missing_fields:
+        prompts.append(f"承認者: <{' か '.join(KNOWN_APPROVERS.keys())}>")
     note = (
         "\n(プロジェクトに紐づかない契約書は「CSRI」を指定してください)"
         if "project_name" in missing_fields else ""
     )
     say(
         "投稿内容・ファイル名・契約書の中身から自動判定を試みましたが、"
-        "次の項目が確認できませんでした。このスレッドで返信してください。\n"
+        "次の項目が確認できませんでした。このスレッドで返信してください"
+        "(承認者は毎回、人が選んで確認する運用のため必ず聞いています)。\n"
         f"`{' / '.join(prompts)}`" + note,
         thread_ts=thread_ts,
     )
@@ -576,6 +598,9 @@ def handle_contract_files(event: dict, say):
             if method not in CONTRACT_METHODS:
                 missing_fields.append("method")
                 method = ""
+            # 承認者はプロジェクト/契約内容から自動的に決まらない人の判断のため、
+            # 毎回Slackスレッドで確認する(自動判定・自動デフォルトはしない)。
+            missing_fields.append("approver")
 
             pending = {
                 "filename": filename,
@@ -586,6 +611,8 @@ def handle_contract_files(event: dict, say):
                 "project_auto_defaulted": project_auto_defaulted,
                 "method": method,
                 "mail_address": mail_address if method == "原本捺印" else "",
+                "approver_id": None,
+                "approver_name": "",
                 "missing_fields": missing_fields,
                 "stage": "awaiting_fields" if missing_fields else "awaiting_confirm",
             }
@@ -652,6 +679,26 @@ def handle_nda_field_reply(event: dict, say) -> bool:
                 return True
             pending["method"] = method
             missing.remove("method")
+
+    if "approver" in missing:
+        m = APPROVER_REPLY_PATTERN.search(text)
+        if m:
+            approver_name = m.group(1).strip()
+            approver_id = KNOWN_APPROVERS.get(approver_name)
+
+            if approver_id is None:
+                say(
+                    f":warning: 承認者「{approver_name}」は対応表(KNOWN_APPROVERS)に"
+                    "登録されていません。登録済みの名前と完全に一致させて返信するか、"
+                    "freeeの承認者選択画面等でその人のユーザーIDを確認してコードに"
+                    "追記してください。",
+                    thread_ts=thread_ts,
+                )
+                return True
+
+            pending["approver_id"] = approver_id
+            pending["approver_name"] = approver_name
+            missing.remove("approver")
 
     pending["missing_fields"] = missing
 
@@ -741,14 +788,12 @@ def handle_reaction_added(event, say, logger):
             receipt_id=receipt_id,
             section_id=pending["section_id"],
             method=pending["method"],
+            approver_id=pending["approver_id"],
             mail_address=pending.get("mail_address", ""),
         )
         say(
-            f":white_check_mark: freeeにNDA契約締結申請の下書きを作成しました"
-            f"(下書きID: {approval.get('id')} / タイトル: {contract_title})\n"
-            f"承認者の選択は人による判断が必要なため自動化していません。"
-            f"freeeにログインし、申請/自動精算 > 下書き一覧 から本申請を開き、"
-            f"承認者を選択して「申請」を押してください。",
+            f":white_check_mark: freeeへNDA契約締結申請を行いました"
+            f"(申請番号: {approval.get('application_number')} / 承認者: {pending['approver_name']})",
             thread_ts=target_thread_ts,
         )
     except Exception as e:

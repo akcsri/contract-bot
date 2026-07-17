@@ -5,6 +5,7 @@ import time
 import json
 import logging
 import datetime
+import unicodedata
 
 import requests
 import fitz  # PyMuPDF
@@ -100,6 +101,23 @@ KNOWN_PROJECT_SECTION_IDS = {
 KNOWN_APPROVERS = {
     "金子明彦": 13323251,
 }
+
+
+def normalize_name(name: str) -> str:
+    """全角/半角・空白種類の違いを吸収してから比較するための正規化。
+    (Slackでの手入力やIMEの変換で、全角空白や異体の空白文字が
+    混ざっても一致するようにする)
+    """
+    return unicodedata.normalize("NFKC", name).translate(
+        {ord(c): None for c in " 　\t​"}
+    )
+
+
+_NORMALIZED_KNOWN_APPROVERS = {normalize_name(k): v for k, v in KNOWN_APPROVERS.items()}
+
+
+def find_approver_id_by_name(name: str):
+    return _NORMALIZED_KNOWN_APPROVERS.get(normalize_name(name))
 
 PDF_MIMETYPES = {"application/pdf"}
 PDF_FILETYPES = {"pdf"}
@@ -684,7 +702,12 @@ def handle_nda_field_reply(event: dict, say) -> bool:
         m = APPROVER_REPLY_PATTERN.search(text)
         if m:
             approver_name = m.group(1).strip()
-            approver_id = KNOWN_APPROVERS.get(approver_name)
+            approver_id = find_approver_id_by_name(approver_name)
+            logger.info(
+                f"[approver] 抽出した名前: {approver_name!r} "
+                f"/ 対応表のキー一覧: {[k for k in KNOWN_APPROVERS]!r} "
+                f"/ 一致: {approver_id is not None}"
+            )
 
             if approver_id is None:
                 say(

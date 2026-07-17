@@ -4,6 +4,7 @@ import re
 import time
 import json
 import logging
+import datetime
 
 import requests
 import fitz  # PyMuPDF
@@ -408,6 +409,12 @@ def create_nda_approval_request(
         "approval_flow_route_id": FREEE_APPROVAL_FLOW_ROUTE_ID,
         "title": title,
         "draft": False,  # false = 下書きではなく即申請する
+        # ブラウザの下書き保存時のペイロードに合わせて明示的に含める
+        # (申請経路の解決にこれらのコンテキストが必要な可能性があるため)
+        "approver_id": None,
+        "group_id": None,
+        "applicant_group_id": None,
+        "observer_user_ids": [],
         "request_items": [
             {"id": 346116, "type": "title", "value": title},
             {"id": 57980, "type": "section", "value": str(section_id)},
@@ -715,7 +722,7 @@ def handle_reaction_added(event, say, logger):
         approval = create_nda_approval_request(
             title=contract_title,
             counterparty=format_parties(result),
-            contract_date=result.get("contract_date") or "",
+            contract_date=result.get("contract_date") or datetime.date.today().isoformat(),
             receipt_id=receipt_id,
             section_id=pending["section_id"],
             method=pending["method"],

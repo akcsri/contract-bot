@@ -65,8 +65,11 @@ RENDER_API_BASE = "https://api.render.com/v1"
 # 増やす/変える場合はここを編集してください)
 CONTRACT_METHODS = ["電子署名（CSRI発信）", "原本捺印"]
 
-# freeeへの送信を承認したとみなすリアクション
+# freeeへの送信を承認したとみなすリアクション(そのまま申請する)
 APPROVE_REACTIONS = {"+1", "thumbsup", "white_check_mark", "heavy_check_mark"}
+# 下書きとして保存し、担当者が後で内容を確認・修正してから
+# freee上で自分で「申請」を押すことを選んだとみなすリアクション
+DRAFT_REACTIONS = {"memo", "pencil2", "spiral_note_pad"}
 
 app = App(
     token=SLACK_BOT_TOKEN,
@@ -607,11 +610,11 @@ def upload_file_to_freee(file_bytes: bytes, filename: str) -> int:
 
 def create_nda_approval_request(
     *, title: str, contract_date: str,
-    receipt_id: int, section_id: int, method: str, approver_id: int,
+    receipt_id: int, section_id: int, method: str, approver_id: int = None,
     applicant_id: int = None, partner_value: str = "", new_partner_name: str = "",
-    mail_address: str = "",
+    mail_address: str = "", draft: bool = False,
 ) -> dict:
-    """NDA契約締結申請(freeeの汎用申請フォーム, form_id=87137)を作成し、申請する。
+    """NDA契約締結申請(freeeの汎用申請フォーム, form_id=87137)を作成する。
 
     各項目には、freee側のフォーム定義に紐づく固定の`id`を指定する必要がある
     (`type`と`value`だけでは「Idを入力してください」というバリデーション
@@ -620,27 +623,29 @@ def create_nda_approval_request(
     フォームの項目が追加/削除/並び替えされた場合はここも合わせて調整すること。
     最初のmulti_lineは「原本送付先」欄(押印方法が原本捺印の場合のみ使用)。
 
-    承認者(approver_id)はプロジェクトや契約内容から自動的に決まるものではなく
-    完全に人の判断による選択のため、Slackスレッドで都度確認し
-    (KNOWN_APPROVERSで名前→IDに変換したうえで)呼び出し元から渡す。
-    このIDはnull/省略のどちらでも「利用できない申請経路IDが指定されています」
-    「approver_idはnullを指定することはできません」というエラーになることを
-    確認済みで、実際に有効なユーザーIDを指定する必要がある。
+    draft=Falseの場合(そのまま申請): 承認者(approver_id)は必須。
+    プロジェクトや契約内容から自動的に決まるものではなく完全に人の判断
+    による選択のため、Slackスレッドで都度確認し(KNOWN_APPROVERSで
+    名前→IDに変換したうえで)呼び出し元から渡す。nullを指定すると
+    「approver_idはnullを指定することはできません」というエラーになる。
+
+    draft=Trueの場合(下書き保存): 承認者はまだ未定でよいため、
+    approver_idキー自体をリクエストボディから省略する(担当者が後で
+    freee上で承認者を選んで「申請」を押す想定)。
 
     申請者(applicant_id)は、APIを呼び出すfreeeアカウント(=このプロセスの
     OAuthトークンの持ち主。常に金子さん)とは独立に指定できる項目。
     GET /api/1/approval_requests/{id}でレスポンスにapplicant_idフィールドが
     含まれていることを確認済みで、Slack投稿者(KNOWN_FREEE_USERSで解決)を
     ここに渡すことで、金子さん以外が投稿した場合でも投稿者本人名義で
-    申請できるようにする(要実地検証)。
+    申請できるようにする。
     """
     body = {
         "company_id": FREEE_COMPANY_ID,
         "form_id": FREEE_NDA_FORM_ID,
         "approval_flow_route_id": FREEE_APPROVAL_FLOW_ROUTE_ID,
         "title": title,
-        "draft": False,  # 承認者が判明しているため、下書きではなく即申請する
-        "approver_id": approver_id,
+        "draft": draft,
         "applicant_id": applicant_id,
         # group_id/applicant_group_id/observer_user_idsはnullでも明示的に含めないと
         # approval_flow_route_idが不正というエラーになることを確認済み。
@@ -660,6 +665,8 @@ def create_nda_approval_request(
             {"id": 757587, "type": "multi_line", "value": ""},
         ],
     }
+    if not draft:
+        body["approver_id"] = approver_id
     resp = requests.post(
         f"{FREEE_API_BASE}/api/1/approval_requests",
         headers=freee_headers(),
@@ -686,8 +693,10 @@ def post_confirmation(pending: dict, thread_ts: str, say):
     )
     counterparty_name = resolve_counterparty_name(result) or "不明"
     lines = [
-        "以下の内容でfreeeにNDA契約締結申請を行います。",
-        "よろしければこのメッセージに :+1: で反応してください。",
+        "以下の内容でfreeeへの登録を行います。",
+        "・そのまま申請する場合: このメッセージに :+1: で反応してください",
+        "・内容を後で担当者が確認・修正してから申請する場合"
+        "(下書き保存のみ): このメッセージに :memo: で反応してください",
         f"タイトル: {contract_title}",
         f"契約当事者: {format_parties(result)}",
         f"相手方(取引先欄): {counterparty_name}",
@@ -1099,8 +1108,13 @@ def handle_reaction_added(event, say, logger):
     """確認メッセージへのリアクションでfreee申請を実行する"""
     logger.info(f"========== REACTION EVENT RECEIVED: {event} ==========")
 
-    if event.get("reaction") not in APPROVE_REACTIONS:
-        logger.info(f"[reaction] 対象外のリアクションのため無視: {event.get('reaction')}")
+    reaction = event.get("reaction")
+    if reaction in APPROVE_REACTIONS:
+        as_draft = False
+    elif reaction in DRAFT_REACTIONS:
+        as_draft = True
+    else:
+        logger.info(f"[reaction] 対象外のリアクションのため無視: {reaction}")
         return
 
     item = event.get("item", {})
@@ -1159,16 +1173,24 @@ def handle_reaction_added(event, say, logger):
             partner_value=partner_value,
             new_partner_name=new_partner_name,
             mail_address=pending.get("mail_address", ""),
+            draft=as_draft,
         )
         logger.info(
-            f"[freee] 申請完了。applicant_id指定値: {pending.get('applicant_id')} / "
+            f"[freee] 登録完了(draft={as_draft})。applicant_id指定値: {pending.get('applicant_id')} / "
             f"レスポンスのapplicant_id: {approval.get('applicant_id')}"
         )
-        say(
-            f":white_check_mark: freeeへNDA契約締結申請を行いました"
-            f"(申請番号: {approval.get('application_number')} / 承認者: {pending['approver_name']})",
-            thread_ts=target_thread_ts,
-        )
+        if as_draft:
+            say(
+                f":memo: freeeに下書きを保存しました(下書きID: {approval.get('id')})。\n"
+                f"内容を確認・修正し、承認者を選んでfreee上で「申請」を押してください。",
+                thread_ts=target_thread_ts,
+            )
+        else:
+            say(
+                f":white_check_mark: freeeへNDA契約締結申請を行いました"
+                f"(申請番号: {approval.get('application_number')} / 承認者: {pending['approver_name']})",
+                thread_ts=target_thread_ts,
+            )
     except Exception as e:
         logger.exception("[freee] approval request creation failed")
         say(f":warning: freee申請の作成に失敗しました: {e}", thread_ts=target_thread_ts)

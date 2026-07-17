@@ -82,18 +82,13 @@ _processed_file_ids = set()
 # 注意: プロセス内メモリのみ。Renderの再起動で消える簡易実装。
 _pending_nda = {}
 
-# --- プロジェクト名 → freee部門(section)ID の対応表 -----------------
-# 本来は /api/1/sections から動的取得する想定だったが、このfreee
-# アカウントのユーザー権限では同APIが user_do_not_have_permission で
-# 使えないため、判明した対応を手動でここに追加していく運用にしている。
-#
-# 新しいプロジェクトのIDを調べる方法:
-#   1. freeeの「各種申請の作成」(NDA契約締結申請)画面を開く
-#   2. ブラウザのDevTools → 「ネットワーク」タブを開いた状態で
-#      「プロジェクト名」のプルダウンから対象のプロジェクトを選択する
-#   3. 直後に飛ぶ `tags_history` へのリクエストのペイロードを見ると
-#      {"tags": [{"category_name": "section", "id": <ID>}]} が確認できる
-#   4. その <ID> と選択したプロジェクト名をこの辞書に追記する
+# --- プロジェクト名 → freee部門(section)ID の対応表(フォールバック用) ---
+# 管理者権限トークンが使えるようになったことで、プロジェクト名の判定は
+# 通常 fetch_freee_sections()/find_section_id_by_name() 経由でfreeeの
+# 実データを直接参照する(この辞書には頼らない)。
+# この辞書は、freeeのAPIが一時的に使えなくなった場合のフォールバックや、
+# 表記ゆれのエイリアス登録(例: freee上の正式名称と少し違う呼び方をSlackで
+# 使いたい場合)にのみ使う。
 KNOWN_PROJECT_SECTION_IDS = {
     "CSRI": 3269199,
     "アバウテック": 3247109,
@@ -474,13 +469,13 @@ def freee_headers(identity: str = "user") -> dict:
 
 
 def fetch_freee_sections() -> list:
-    """freeeの「部門」マスタをAPIから取得する。
+    """freeeの「部門」マスタをAPIから取得する(プロセス内でキャッシュする)。
 
-    注意: このfreeeアカウントのユーザー権限では、/api/1/sections は
-    user_do_not_have_permission で使用できないことが判明している。
-    そのため通常の実行パスではこの関数は使わず、KNOWN_PROJECT_SECTION_IDS
-    (手動管理の対応表)を正として使う。将来的に権限が解決した場合に
-    備えて関数自体は残してある。
+    以前は金子さん本人のユーザー権限ではuser_do_not_have_permissionで
+    使えなかったが、管理者権限のトークン("admin"アイデンティティ)を
+    使うようになったことで取得できるようになった。これにより、
+    プロジェクト名の判定はKNOWN_PROJECT_SECTION_IDS(手動辞書)に頼らず、
+    毎回freeeの最新データを直接参照できる。
     """
     global _sections_cache
     if _sections_cache is not None:
@@ -499,15 +494,38 @@ def fetch_freee_sections() -> list:
 
 
 def get_project_candidates() -> list:
-    """Geminiのプロジェクト名推定に使う候補名一覧(手動管理の対応表のキー)"""
+    """Geminiのプロジェクト名推定に使う候補名一覧。
+
+    まずfreeeから実際に登録されているプロジェクト(部門)名を取得して使う。
+    API呼び出しに失敗した場合(権限が再び失われた等)のみ、
+    手動管理のKNOWN_PROJECT_SECTION_IDSにフォールバックする。
+    """
+    try:
+        sections = fetch_freee_sections()
+        names = [s.get("name") for s in sections if s.get("name")]
+        if names:
+            return names
+    except Exception:
+        logger.exception("[freee] sections取得に失敗したため、手動辞書にフォールバックします")
     return list(KNOWN_PROJECT_SECTION_IDS.keys())
 
 
 def find_section_id_by_name(name: str):
     """プロジェクト名(freee上は部門名)からIDを引く。
-    KNOWN_PROJECT_SECTION_IDSに無い場合はNoneを返す
-    (新しいプロジェクトはtags_history経由でIDを調べて辞書に追記すること)。
+
+    まずfreeeの実データ(fetch_freee_sections)から完全一致で探し、
+    見つからなければ手動辞書(KNOWN_PROJECT_SECTION_IDS。表記ゆれの
+    エイリアスなどを追加したい場合用)にフォールバックする。
     """
+    if not name:
+        return None
+    try:
+        sections = fetch_freee_sections()
+        for s in sections:
+            if s.get("name") == name:
+                return s.get("id")
+    except Exception:
+        logger.exception("[freee] sections取得に失敗したため、手動辞書にフォールバックします")
     return KNOWN_PROJECT_SECTION_IDS.get(name)
 
 
@@ -786,7 +804,7 @@ def handle_contract_files(event: dict, say):
                 # 自信をもって特定できなかった場合は、プロジェクトに
                 # 紐づかない契約として扱い、自動でCSRIにフォールバックする
                 # (Slackでの聞き返しはしない。必要ならfreee上で本人が修正する)。
-                fallback_id = KNOWN_PROJECT_SECTION_IDS.get("CSRI")
+                fallback_id = find_section_id_by_name("CSRI")
                 if fallback_id is not None:
                     section_id = fallback_id
                     project_name = "CSRI"
@@ -969,10 +987,30 @@ def handle_message(event, say, logger):
     if text == "!debug_sections":
         try:
             sections = fetch_freee_sections()
-            names = [s.get("name") for s in sections]
-            say(f":mag: sections取得成功({len(sections)}件): {names}")
+            pairs = [f"{s.get('name')}={s.get('id')}" for s in sections]
+            say(f":mag: sections取得成功({len(sections)}件): {pairs}")
         except Exception as e:
             say(f":warning: sections取得失敗: {e}")
+        return
+
+    # プロジェクト名(部門名)をキーワードで検索してIDを調べるコマンド。
+    # 例: "!find_project Jaguar" と投稿すると、名前に"Jaguar"を含む
+    # sectionをid付きで返す。KNOWN_PROJECT_SECTION_IDSに追記する際に使う。
+    if text.startswith("!find_project"):
+        keyword = strip_reply_chrome(text[len("!find_project"):])
+        try:
+            sections = fetch_freee_sections()
+            matches = [
+                f"{s.get('name')}={s.get('id')}"
+                for s in sections
+                if keyword.lower() in (s.get("name") or "").lower()
+            ]
+            if matches:
+                say(f":mag: 「{keyword}」に一致するプロジェクト: {matches}")
+            else:
+                say(f":warning: 「{keyword}」に一致するプロジェクトが見つかりませんでした")
+        except Exception as e:
+            say(f":warning: プロジェクト検索失敗: {e}")
         return
 
     # 動作確認用コマンド: NDA申請フォーム(87137)自体の定義を取得する。

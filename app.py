@@ -414,10 +414,10 @@ def create_nda_approval_request(
         "approval_flow_route_id": FREEE_APPROVAL_FLOW_ROUTE_ID,
         "title": title,
         "draft": True,  # 承認者は人が選ぶ必要があるため下書きとして作成する
-        # これらのフィールドはnullでも明示的に含めないと、
+        # group_id/applicant_group_id/observer_user_idsはnullでも明示的に含めないと
         # approval_flow_route_idが不正というエラーになることを確認済み。
-        # 下書き作成時はapprover_id=nullで問題ない(必須になるのは申請=draft:false時のみ)。
-        "approver_id": None,
+        # 一方approver_idは「キー自体を省略」しないとエラーになる
+        # (null不可、かつ下書きでは値も決まっていないため)。
         "group_id": None,
         "applicant_group_id": None,
         "observer_user_ids": [],

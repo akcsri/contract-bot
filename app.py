@@ -760,6 +760,18 @@ def handle_message(event, say, logger):
     if event.get("thread_ts") and handle_nda_field_reply(event, say):
         return
 
+    # 動作確認用コマンド: 権限が変わったfreeeトークンでsections/approval_flow_routes
+    # が読めるようになったかを直接確認する(下書きコード内のfetch_freee_sectionsを使用)。
+    text = (event.get("text") or "").strip()
+    if text == "!debug_sections":
+        try:
+            sections = fetch_freee_sections()
+            names = [s.get("name") for s in sections]
+            say(f":mag: sections取得成功({len(sections)}件): {names}")
+        except Exception as e:
+            say(f":warning: sections取得失敗: {e}")
+        return
+
     # ファイル無しの通常メッセージ(動作確認用)
     say("イベント受信成功")
 

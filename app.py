@@ -10,6 +10,7 @@ import unicodedata
 import requests
 import fitz  # PyMuPDF
 from docx import Document
+import msoffcrypto  # パスワード付きWord(.docx)の復号に使用(要requirements.txt追加)
 
 from google import genai
 from google.genai import types
@@ -84,6 +85,11 @@ _processed_file_ids = set()
 # NDA判定〜freee申請までの一時状態(thread_ts をキーに保持)
 # 注意: プロセス内メモリのみ。Renderの再起動で消える簡易実装。
 _pending_nda = {}
+
+# パスワード待ちのファイル(thread_ts をキーに保持)。
+# 同一メッセージに複数のパスワード付きファイルがあると後勝ちで
+# 上書きされる制限があるが、通常1メッセージ1ファイルの運用のため許容している。
+_pending_password = {}
 
 # --- プロジェクト名 → freee部門(section)ID の対応表(フォールバック用) ---
 # 管理者権限トークンが使えるようになったことで、プロジェクト名の判定は
@@ -282,6 +288,60 @@ def extract_docx_text(docx_bytes: bytes) -> str:
                 if cell.text.strip():
                     parts.append(cell.text)
     return "\n".join(parts)
+
+
+# =====================================================================
+# パスワード付きファイルの検出・復号
+# =====================================================================
+# 開くのにパスワードが必要な(暗号化された)PDF/Wordファイルへの対応。
+# Slack投稿本文に「パスワード: xxxx」等の記載があればそれを使い、
+# 記載が無ければスレッドで聞き返す(handle_password_reply参照)。
+
+PASSWORD_REPLY_PATTERN = re.compile(r"(?:パスワード|ぱすわーど|pw|pass(?:word)?)[:：]\s*(\S+)", re.IGNORECASE)
+
+
+def is_pdf_password_protected(raw_bytes: bytes) -> bool:
+    try:
+        doc = fitz.open(stream=raw_bytes, filetype="pdf")
+        try:
+            return doc.needs_pass
+        finally:
+            doc.close()
+    except Exception:
+        # 破損ファイル等、開けないこと自体は別のエラーとして後段で扱う
+        return False
+
+
+def decrypt_pdf(raw_bytes: bytes, password: str):
+    """パスワードが正しければ復号後のPDFバイト列を返す。誤りならNone。"""
+    doc = fitz.open(stream=raw_bytes, filetype="pdf")
+    try:
+        if not doc.authenticate(password):
+            return None
+        return doc.tobytes(encryption=fitz.PDF_ENCRYPT_NONE)
+    finally:
+        doc.close()
+
+
+def is_docx_password_protected(raw_bytes: bytes) -> bool:
+    try:
+        office_file = msoffcrypto.OfficeFile(io.BytesIO(raw_bytes))
+        return office_file.is_encrypted()
+    except Exception:
+        return False
+
+
+def decrypt_docx(raw_bytes: bytes, password: str):
+    """パスワードが正しければ復号後のdocxバイト列を返す。誤りならNone。"""
+    try:
+        office_file = msoffcrypto.OfficeFile(io.BytesIO(raw_bytes))
+        office_file.load_key(password=password)
+        decrypted = io.BytesIO()
+        office_file.decrypt(decrypted)
+        return decrypted.getvalue()
+    except Exception:
+        logger.info("[password] docx復号に失敗(パスワード誤りの可能性)")
+        return None
 
 
 # =====================================================================
@@ -807,6 +867,119 @@ def prompt_for_missing_fields(missing_fields: list, thread_ts: str, say):
     )
 
 
+def process_contract_document(
+    *, raw_bytes: bytes, filename: str, is_pdf: bool,
+    message_text: str, thread_ts: str, posting_slack_user_id: str,
+    project_candidates: list, say,
+):
+    """復号済み(もしくは元々パスワード無し)のファイルをGeminiで解析し、
+    NDAならfreee申請の準備(項目収集→確認)まで進める。
+    パスワード関連の処理を通過した後の、共通の本処理部分。
+    """
+    try:
+        if is_pdf:
+            page_count = get_pdf_page_count(raw_bytes)
+            logger.info(f"[PDF] sending to Gemini({GEMINI_MODEL}): {filename}")
+            result = analyze_contract_with_gemini(
+                pdf_bytes=raw_bytes,
+                message_text=message_text,
+                filename=filename,
+                project_candidates=project_candidates,
+            )
+            meta_line = f"ページ数: {page_count}"
+
+        else:  # docx
+            text = extract_docx_text(raw_bytes)
+            if not text.strip():
+                logger.warning(f"[DOCX] no extractable text: {filename}")
+                say(f":warning: Wordファイルからテキストを抽出できませんでした: {filename}")
+                return
+            logger.info(f"[DOCX] sending to Gemini({GEMINI_MODEL}): {filename}")
+            result = analyze_contract_with_gemini(
+                text=text,
+                message_text=message_text,
+                filename=filename,
+                project_candidates=project_candidates,
+            )
+            meta_line = f"文字数: {len(text)}"
+
+        logger.info(f"[FILE] gemini result: {result}")
+        say(format_analysis_message(filename, meta_line, result))
+
+        if not result.get("is_nda"):
+            return
+
+        project_name = (result.get("project_name") or "").strip()
+        method = (result.get("method") or "").strip()
+        mail_address = (result.get("physical_mail_address") or "").strip()
+
+        section_id = None
+        if project_name:
+            section_id = find_section_id_by_name(project_name)
+
+        project_auto_defaulted = False
+        if section_id is None:
+            # 自信をもって特定できなかった場合は、プロジェクトに
+            # 紐づかない契約として扱い、自動でCSRIにフォールバックする
+            # (Slackでの聞き返しはしない。必要ならfreee上で本人が修正する)。
+            fallback_id = find_section_id_by_name("CSRI")
+            if fallback_id is not None:
+                section_id = fallback_id
+                project_name = "CSRI"
+                project_auto_defaulted = True
+
+        missing_fields = []
+        if section_id is None:
+            # CSRI自体が対応表に無い場合のみ(通常起きない)、聞き返しにフォールバック
+            missing_fields.append("project_name")
+            project_name = ""
+        if method not in CONTRACT_METHODS:
+            missing_fields.append("method")
+            method = ""
+        # 承認者はプロジェクト/契約内容から自動的に決まらない人の判断のため、
+        # 毎回Slackスレッドで確認する(自動判定・自動デフォルトはしない)。
+        missing_fields.append("approver")
+
+        # 申請者(applicant_id)はSlack投稿者に対応するfreeeユーザーID。
+        # 未登録の場合は金子さん名義にフォールバックし、確認メッセージで
+        # その旨を明示する(申請自体は失敗させない)。
+        applicant_id = find_applicant_id_by_slack_user(posting_slack_user_id)
+        applicant_auto_defaulted = applicant_id is None
+        if applicant_id is None:
+            applicant_id = KNOWN_FREEE_USERS.get(AKIHIKO_SLACK_USER_ID)  # 金子明彦にフォールバック
+
+        pending = {
+            "filename": filename,
+            "raw_bytes": raw_bytes,
+            "gemini_result": result,
+            "section_id": section_id,
+            "section_name": project_name,
+            "project_auto_defaulted": project_auto_defaulted,
+            "method": method,
+            "mail_address": mail_address if method == "原本捺印" else "",
+            "approver_id": None,
+            "approver_name": "",
+            "posting_slack_user_id": posting_slack_user_id,
+            "applicant_id": applicant_id,
+            "applicant_auto_defaulted": applicant_auto_defaulted,
+            "missing_fields": missing_fields,
+            "stage": "awaiting_fields" if missing_fields else "awaiting_confirm",
+        }
+        _pending_nda[thread_ts] = pending
+
+        if missing_fields:
+            prompt_for_missing_fields(missing_fields, thread_ts, say)
+        else:
+            post_confirmation(pending, thread_ts, say)
+
+    except json.JSONDecodeError as e:
+        logger.exception(f"[FILE] gemini response was not valid JSON: {filename}")
+        say(f":warning: Geminiの解析結果を読み取れませんでした: {filename} ({e})")
+    except Exception as e:
+        logger.exception(f"[FILE] processing failed: {filename}")
+        say(f":warning: ファイルの処理に失敗しました: {filename} ({e})")
+
+
 def handle_contract_files(event: dict, say):
     files = event.get("files", [])
     target_files = [f for f in files if is_pdf_file(f) or is_docx_file(f)]
@@ -830,116 +1003,64 @@ def handle_contract_files(event: dict, say):
             continue
         _processed_file_ids.add(file_id)
 
+        thread_ts = message_ts
+        is_pdf = is_pdf_file(f)
+
         try:
             logger.info(f"[FILE] downloading: {filename} ({file_id})")
             raw_bytes = download_slack_file(f)
-
-            if is_pdf_file(f):
-                page_count = get_pdf_page_count(raw_bytes)
-                logger.info(f"[PDF] sending to Gemini({GEMINI_MODEL}): {filename}")
-                result = analyze_contract_with_gemini(
-                    pdf_bytes=raw_bytes,
-                    message_text=message_text,
-                    filename=filename,
-                    project_candidates=project_candidates,
-                )
-                meta_line = f"ページ数: {page_count}"
-
-            else:  # docx
-                text = extract_docx_text(raw_bytes)
-                if not text.strip():
-                    logger.warning(f"[DOCX] no extractable text: {filename}")
-                    say(f":warning: Wordファイルからテキストを抽出できませんでした: {filename}")
-                    continue
-                logger.info(f"[DOCX] sending to Gemini({GEMINI_MODEL}): {filename}")
-                result = analyze_contract_with_gemini(
-                    text=text,
-                    message_text=message_text,
-                    filename=filename,
-                    project_candidates=project_candidates,
-                )
-                meta_line = f"文字数: {len(text)}"
-
-            logger.info(f"[FILE] gemini result: {result}")
-            say(format_analysis_message(filename, meta_line, result))
-
-            if not result.get("is_nda"):
-                continue
-
-            thread_ts = message_ts
-
-            project_name = (result.get("project_name") or "").strip()
-            method = (result.get("method") or "").strip()
-            mail_address = (result.get("physical_mail_address") or "").strip()
-
-            section_id = None
-            if project_name:
-                section_id = find_section_id_by_name(project_name)
-
-            project_auto_defaulted = False
-            if section_id is None:
-                # 自信をもって特定できなかった場合は、プロジェクトに
-                # 紐づかない契約として扱い、自動でCSRIにフォールバックする
-                # (Slackでの聞き返しはしない。必要ならfreee上で本人が修正する)。
-                fallback_id = find_section_id_by_name("CSRI")
-                if fallback_id is not None:
-                    section_id = fallback_id
-                    project_name = "CSRI"
-                    project_auto_defaulted = True
-
-            missing_fields = []
-            if section_id is None:
-                # CSRI自体が対応表に無い場合のみ(通常起きない)、聞き返しにフォールバック
-                missing_fields.append("project_name")
-                project_name = ""
-            if method not in CONTRACT_METHODS:
-                missing_fields.append("method")
-                method = ""
-            # 承認者はプロジェクト/契約内容から自動的に決まらない人の判断のため、
-            # 毎回Slackスレッドで確認する(自動判定・自動デフォルトはしない)。
-            missing_fields.append("approver")
-
-            # 申請者(applicant_id)はSlack投稿者に対応するfreeeユーザーID。
-            # 未登録の場合は金子さん名義にフォールバックし、確認メッセージで
-            # その旨を明示する(申請自体は失敗させない)。
-            applicant_id = find_applicant_id_by_slack_user(posting_slack_user_id)
-            applicant_auto_defaulted = applicant_id is None
-            if applicant_id is None:
-                applicant_id = KNOWN_FREEE_USERS.get(AKIHIKO_SLACK_USER_ID)  # 金子明彦にフォールバック
-
-            pending = {
-                "filename": filename,
-                "raw_bytes": raw_bytes,
-                "gemini_result": result,
-                "section_id": section_id,
-                "section_name": project_name,
-                "project_auto_defaulted": project_auto_defaulted,
-                "method": method,
-                "mail_address": mail_address if method == "原本捺印" else "",
-                "approver_id": None,
-                "approver_name": "",
-                "posting_slack_user_id": posting_slack_user_id,
-                "applicant_id": applicant_id,
-                "applicant_auto_defaulted": applicant_auto_defaulted,
-                "missing_fields": missing_fields,
-                "stage": "awaiting_fields" if missing_fields else "awaiting_confirm",
-            }
-            _pending_nda[thread_ts] = pending
-
-            if missing_fields:
-                prompt_for_missing_fields(missing_fields, thread_ts, say)
-            else:
-                post_confirmation(pending, thread_ts, say)
-
         except requests.HTTPError as e:
             logger.exception(f"[FILE] download failed: {filename}")
             say(f":warning: ファイルのダウンロードに失敗しました: {filename} ({e})")
-        except json.JSONDecodeError as e:
-            logger.exception(f"[FILE] gemini response was not valid JSON: {filename}")
-            say(f":warning: Geminiの解析結果を読み取れませんでした: {filename} ({e})")
-        except Exception as e:
-            logger.exception(f"[FILE] processing failed: {filename}")
-            say(f":warning: ファイルの処理に失敗しました: {filename} ({e})")
+            continue
+
+        # --- パスワード保護されたファイルへの対応 ---------------------
+        is_protected = is_pdf_password_protected(raw_bytes) if is_pdf else is_docx_password_protected(raw_bytes)
+        if is_protected:
+            m = PASSWORD_REPLY_PATTERN.search(message_text)
+            password = strip_reply_chrome(m.group(1)) if m else None
+
+            if password:
+                decrypted = decrypt_pdf(raw_bytes, password) if is_pdf else decrypt_docx(raw_bytes, password)
+                if decrypted is not None:
+                    logger.info(f"[password] 投稿本文記載のパスワードで復号成功: {filename}")
+                    process_contract_document(
+                        raw_bytes=decrypted, filename=filename, is_pdf=is_pdf,
+                        message_text=message_text, thread_ts=thread_ts,
+                        posting_slack_user_id=posting_slack_user_id,
+                        project_candidates=project_candidates, say=say,
+                    )
+                    continue
+                logger.warning(f"[password] 投稿本文記載のパスワードが誤り: {filename}")
+                say(
+                    f":lock: *{filename}* にパスワードが設定されていますが、"
+                    "投稿本文に記載のパスワードでは開けませんでした。"
+                    "このスレッドに正しいパスワードを返信してください。",
+                    thread_ts=thread_ts,
+                )
+            else:
+                say(
+                    f":lock: *{filename}* にはパスワードが設定されているようです。"
+                    "このスレッドにファイルのパスワードを返信してください。",
+                    thread_ts=thread_ts,
+                )
+
+            _pending_password[thread_ts] = {
+                "raw_bytes": raw_bytes,
+                "filename": filename,
+                "is_pdf": is_pdf,
+                "message_text": message_text,
+                "posting_slack_user_id": posting_slack_user_id,
+                "project_candidates": project_candidates,
+            }
+            continue
+
+        process_contract_document(
+            raw_bytes=raw_bytes, filename=filename, is_pdf=is_pdf,
+            message_text=message_text, thread_ts=thread_ts,
+            posting_slack_user_id=posting_slack_user_id,
+            project_candidates=project_candidates, say=say,
+        )
 
 
 def strip_reply_chrome(s: str) -> str:
@@ -947,6 +1068,55 @@ def strip_reply_chrome(s: str) -> str:
     (バッククォート `` ` `` や、ヒントの `<name>` 表記の山括弧など)。
     """
     return s.strip().strip("`<>「」\"'")
+
+
+def handle_password_reply(event: dict, say) -> bool:
+    """パスワード待ちのファイルへの返信を処理する。
+    返信全体をパスワードとして扱う(「パスワード: xxx」の形式でも、
+    xxxだけの直書きでもどちらでも受け付ける)。
+    処理した場合True、対象外ならFalseを返す。
+    """
+    thread_ts = event.get("thread_ts")
+    pending = _pending_password.get(thread_ts)
+    if not pending:
+        return False
+
+    text = event.get("text", "")
+    m = PASSWORD_REPLY_PATTERN.search(text)
+    password = strip_reply_chrome(m.group(1) if m else text)
+
+    if not password:
+        return False
+
+    filename = pending["filename"]
+    is_pdf = pending["is_pdf"]
+    decrypted = (
+        decrypt_pdf(pending["raw_bytes"], password)
+        if is_pdf
+        else decrypt_docx(pending["raw_bytes"], password)
+    )
+
+    if decrypted is None:
+        say(
+            f":warning: そのパスワードでは *{filename}* を開けませんでした。"
+            "もう一度、正しいパスワードを返信してください。",
+            thread_ts=thread_ts,
+        )
+        return True
+
+    logger.info(f"[password] スレッド返信のパスワードで復号成功: {filename}")
+    _pending_password.pop(thread_ts, None)
+    process_contract_document(
+        raw_bytes=decrypted,
+        filename=filename,
+        is_pdf=is_pdf,
+        message_text=pending["message_text"],
+        thread_ts=thread_ts,
+        posting_slack_user_id=pending["posting_slack_user_id"],
+        project_candidates=pending["project_candidates"],
+        say=say,
+    )
+    return True
 
 
 def handle_nda_field_reply(event: dict, say) -> bool:
@@ -1052,6 +1222,9 @@ def handle_message(event, say, logger):
 
     if event.get("files"):
         handle_contract_files(event, say)
+        return
+
+    if event.get("thread_ts") and handle_password_reply(event, say):
         return
 
     if event.get("thread_ts") and handle_nda_field_reply(event, say):

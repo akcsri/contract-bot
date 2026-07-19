@@ -144,14 +144,22 @@ def find_approver_id_by_name(name: str):
     return _NORMALIZED_KNOWN_APPROVERS.get(normalize_name(name))
 
 
+# 金子明彦さんご本人のSlackユーザーID(識別用の特別扱いに使う)
+AKIHIKO_SLACK_USER_ID = "U07PUQG9NNQ"
+
 # --- Slackユーザー → freeeユーザーID(申請者)の対応表 --------------------
-# freeeのNDA承認経路上は「申請者=freeeにログインしたユーザー」ではなく、
-# APIリクエストのapplicant_idフィールドで独立に指定できることが、実際に
-# 作成済みの申請(id: 9376018)をGET /api/1/approval_requests/{id}で確認した
-# ところ判明した。そのため、Slackで投稿した人がAkihiko(金子)さん以外でも、
-# 金子さん(または管理者)のfreeeトークンでAPIを呼び出したまま、
-# applicant_idだけをSlack投稿者に応じて切り替えれば、投稿者本人に
-# 個別のfreee OAuth認可をしてもらう必要が無いはず(要実地検証)。
+# 当初は「申請者(applicant_id)はAPIリクエストで独立に指定でき、金子さんの
+# トークンのままapplicant_idだけ切り替えれば済むはず」と考えていたが、
+# 実地検証(吉田さんの投稿でapplicant_id=吉田さんのIDを指定)の結果、
+# レスポンスのapplicant_idは常に金子さんのままだった。つまり、
+# 申請者は「実際にAPIを呼び出したfreeeアカウント本人」で決まり、
+# request body上のapplicant_idでは上書きできないことが判明した。
+#
+# そのため、この辞書(Slack投稿者→freeeユーザーID)は主に確認メッセージの
+# 表示用に使う。実際にその人本人の名義で申請するには、KNOWN_FREEE_USERSの
+# 登録に加えて、その人自身のrefresh_tokenを環境変数
+# FREEE_REFRESH_TOKEN_<SlackユーザーID> として登録する必要がある
+# (resolve_freee_identity()参照)。
 #
 # 新しいSlackユーザーを追加する方法:
 #   1. Slackプロフィールの「その他」→「メンバーIDをコピー」でSlackユーザーID
@@ -365,12 +373,22 @@ def format_analysis_message(filename: str, meta_line: str, result: dict) -> str:
 # freee 連携
 # =====================================================================
 
-# 2つのfreeeアイデンティティ(=それぞれ別のrefresh_token)を使い分ける。
-#   "user"  : 金子さん本人。証憑アップロードと申請作成(申請者本人が前提の
-#             承認経路を使うため)は必ずこちらを使う。
-#   "admin" : 管理者権限を持つ別ユーザー。sections/approval_flow_routesなど、
-#             金子さんの権限では読めないマスタ系APIの参照専用。
-#             FREEE_ADMIN_REFRESH_TOKEN未設定の場合は"user"にフォールバックする。
+# freeeの「申請者」はAPIを実際に呼び出したアカウント本人になり、
+# request body上のapplicant_idでは上書きできないことを実地検証済み
+# (吉田さんのSlack投稿で、applicant_id=吉田さんのIDを指定しても
+# レスポンスは金子さんのIDになった)。そのため、Slack投稿者本人の名義で
+# 申請するには、その人自身のrefresh_tokenでAPIを呼ぶ必要がある。
+#
+# アイデンティティ(=それぞれ別のrefresh_token)を複数管理する:
+#   "user"  : 金子さん本人。デフォルト(登録が無い投稿者はここにフォールバック)。
+#   "admin" : 管理者権限を持つユーザー(吉田さん)。sections/approval_flow_routes
+#             など、金子さんの権限では読めないマスタ系APIの参照用に加え、
+#             吉田さんご本人が投稿した場合の申請者トークンとしても使う。
+#   "<SlackユーザーID>" : その他の個人。環境変数
+#             FREEE_REFRESH_TOKEN_<SlackユーザーID> (例:
+#             FREEE_REFRESH_TOKEN_U07UBPGDT7X) が設定されていれば、
+#             起動時に自動でここに登録される。追加のコード変更は不要で、
+#             Renderに環境変数を追加するだけでよい。
 _freee_token_caches = {
     "user": {
         "refresh_token": FREEE_REFRESH_TOKEN,
@@ -385,6 +403,51 @@ _freee_token_caches = {
         "expires_at": 0,
     },
 }
+
+# 環境変数 FREEE_REFRESH_TOKEN_<SlackユーザーID> を自動的にスキャンして
+# 個人アイデンティティとして登録する。
+_PERSONAL_TOKEN_ENV_PREFIX = "FREEE_REFRESH_TOKEN_"
+for _env_key, _env_value in os.environ.items():
+    if _env_key.startswith(_PERSONAL_TOKEN_ENV_PREFIX) and _env_value:
+        _slack_id = _env_key[len(_PERSONAL_TOKEN_ENV_PREFIX):]
+        _freee_token_caches[_slack_id] = {
+            "refresh_token": _env_value,
+            "render_env_key": _env_key,
+            "access_token": None,
+            "expires_at": 0,
+        }
+        logger.info(f"[freee] 個人アイデンティティを登録しました: {_slack_id} (env: {_env_key})")
+
+# Slackユーザー→識別子の手動マッピング(環境変数の命名規則に頼らない特例用)。
+# 吉田さんは"admin"アイデンティティ(FREEE_ADMIN_REFRESH_TOKEN)を
+# 申請者トークンとしてもそのまま流用する。
+SLACK_USER_TO_FREEE_IDENTITY = {
+    "U06MND3BB6E": "admin",  # 吉田愛美
+}
+
+
+def resolve_freee_identity(slack_user_id: str) -> str:
+    """Slack投稿者のユーザーIDから、その人自身のfreeeトークンのアイデンティティ
+    キーを解決する。個別トークンが登録されていなければ"user"(金子さん)
+    にフォールバックする。
+    """
+    if slack_user_id in SLACK_USER_TO_FREEE_IDENTITY:
+        return SLACK_USER_TO_FREEE_IDENTITY[slack_user_id]
+    if slack_user_id in _freee_token_caches:
+        return slack_user_id
+    return "user"
+
+
+def _describe_applicant_identity(slack_user_id: str) -> str:
+    """確認メッセージ用に、申請者名義の状態を説明する文言を返す。"""
+    identity = resolve_freee_identity(slack_user_id)
+    if identity != "user":
+        return "(投稿者ご本人名義で申請されます)"
+    if slack_user_id == AKIHIKO_SLACK_USER_ID:
+        return "(ご本人名義で申請されます)"
+    return "(投稿者ご本人のトークンが未登録のため、金子明彦名義で申請されます)"
+
+
 _sections_cache = None
 
 
@@ -593,11 +656,16 @@ def resolve_counterparty_fields(counterparty_name: str) -> tuple:
     return "", counterparty_name
 
 
-def upload_file_to_freee(file_bytes: bytes, filename: str) -> int:
-    """freeeのファイルボックス(証憑)にアップロードし、receipt idを返す"""
+def upload_file_to_freee(file_bytes: bytes, filename: str, identity: str = "user") -> int:
+    """freeeのファイルボックス(証憑)にアップロードし、receipt idを返す。
+
+    identityには、Slack投稿者本人のfreeeトークンを使うべきかどうかを
+    resolve_freee_identity()で解決した値を渡す(申請者=証憑をアップロード
+    したアカウント、という前提と揃えるため)。
+    """
     resp = requests.post(
         f"{FREEE_API_BASE}/api/1/receipts",
-        headers=freee_headers(),
+        headers=freee_headers(identity),
         data={"company_id": FREEE_COMPANY_ID, "description": filename},
         files={"receipt": (filename, file_bytes)},
         timeout=60,
@@ -612,7 +680,7 @@ def create_nda_approval_request(
     *, title: str, contract_date: str,
     receipt_id: int, section_id: int, method: str, approver_id: int = None,
     applicant_id: int = None, partner_value: str = "", new_partner_name: str = "",
-    mail_address: str = "", draft: bool = False,
+    mail_address: str = "", draft: bool = False, identity: str = "user",
 ) -> dict:
     """NDA契約締結申請(freeeの汎用申請フォーム, form_id=87137)を作成する。
 
@@ -633,12 +701,14 @@ def create_nda_approval_request(
     approver_idキー自体をリクエストボディから省略する(担当者が後で
     freee上で承認者を選んで「申請」を押す想定)。
 
-    申請者(applicant_id)は、APIを呼び出すfreeeアカウント(=このプロセスの
-    OAuthトークンの持ち主。常に金子さん)とは独立に指定できる項目。
-    GET /api/1/approval_requests/{id}でレスポンスにapplicant_idフィールドが
-    含まれていることを確認済みで、Slack投稿者(KNOWN_FREEE_USERSで解決)を
-    ここに渡すことで、金子さん以外が投稿した場合でも投稿者本人名義で
-    申請できるようにする。
+    申請者は、request body上のapplicant_idでは上書きできず、実際に
+    このAPIを呼び出したfreeeアカウント本人になることを実地検証済み
+    (吉田さんの投稿でapplicant_idに吉田さんのIDを指定しても、
+    レスポンスは金子さんのIDになった)。そのため、投稿者本人名義で
+    申請するには、identity引数でその人自身のfreeeトークンを指定して
+    呼び出す必要がある(resolve_freee_identity()で解決する)。
+    applicant_idはあくまで参考情報として送っているが、実際の申請者を
+    決めるのはidentityの方である点に注意。
     """
     body = {
         "company_id": FREEE_COMPANY_ID,
@@ -669,7 +739,7 @@ def create_nda_approval_request(
         body["approver_id"] = approver_id
     resp = requests.post(
         f"{FREEE_API_BASE}/api/1/approval_requests",
-        headers=freee_headers(),
+        headers=freee_headers(identity),
         json=body,
         timeout=30,
     )
@@ -707,9 +777,7 @@ def post_confirmation(pending: dict, thread_ts: str, say):
         f"締結方法: {pending['method']}",
         f"承認者: {pending['approver_name']}",
         f"申請者: freeeユーザーID {pending['applicant_id']}"
-        + ("(投稿者未登録のため金子明彦名義で申請されます。KNOWN_FREEE_USERSに"
-           "登録すると投稿者ご本人名義になります)"
-           if pending.get("applicant_auto_defaulted") else ""),
+        + _describe_applicant_identity(pending.get("posting_slack_user_id")),
     ]
     if pending.get("mail_address"):
         lines.append(f"原本送付先: {pending['mail_address']}")
@@ -837,7 +905,7 @@ def handle_contract_files(event: dict, say):
             applicant_id = find_applicant_id_by_slack_user(posting_slack_user_id)
             applicant_auto_defaulted = applicant_id is None
             if applicant_id is None:
-                applicant_id = KNOWN_FREEE_USERS.get("U07PUQG9NNQ")  # 金子明彦にフォールバック
+                applicant_id = KNOWN_FREEE_USERS.get(AKIHIKO_SLACK_USER_ID)  # 金子明彦にフォールバック
 
             pending = {
                 "filename": filename,
@@ -1142,8 +1210,16 @@ def handle_reaction_added(event, say, logger):
     pending = _pending_nda.pop(target_thread_ts)
 
     try:
+        # 投稿者本人のfreeeトークンが登録されていれば、それを使って
+        # (=その人自身の名義で)証憑アップロード・申請作成を行う。
+        # 未登録の場合は金子さんのトークンにフォールバックする。
+        identity = resolve_freee_identity(pending.get("posting_slack_user_id"))
+        logger.info(
+            f"[freee] 使用するアイデンティティ: {identity} "
+            f"(投稿者Slack ID: {pending.get('posting_slack_user_id')})"
+        )
         logger.info(f"[freee] uploading file: {pending['filename']}")
-        receipt_id = upload_file_to_freee(pending["raw_bytes"], pending["filename"])
+        receipt_id = upload_file_to_freee(pending["raw_bytes"], pending["filename"], identity=identity)
 
         result = pending["gemini_result"]
         logger.info(f"[freee] creating approval request: {pending['filename']}")
@@ -1174,21 +1250,27 @@ def handle_reaction_added(event, say, logger):
             new_partner_name=new_partner_name,
             mail_address=pending.get("mail_address", ""),
             draft=as_draft,
+            identity=identity,
         )
         logger.info(
-            f"[freee] 登録完了(draft={as_draft})。applicant_id指定値: {pending.get('applicant_id')} / "
+            f"[freee] 登録完了(draft={as_draft}, identity={identity})。"
             f"レスポンスのapplicant_id: {approval.get('applicant_id')}"
+        )
+        identity_note = (
+            ""
+            if identity == "user"
+            else f"(申請者名義: {identity}のトークン)"
         )
         if as_draft:
             say(
-                f":memo: freeeに下書きを保存しました(下書きID: {approval.get('id')})。\n"
+                f":memo: freeeに下書きを保存しました(下書きID: {approval.get('id')}){identity_note}。\n"
                 f"内容を確認・修正し、承認者を選んでfreee上で「申請」を押してください。",
                 thread_ts=target_thread_ts,
             )
         else:
             say(
                 f":white_check_mark: freeeへNDA契約締結申請を行いました"
-                f"(申請番号: {approval.get('application_number')} / 承認者: {pending['approver_name']})",
+                f"(申請番号: {approval.get('application_number')} / 承認者: {pending['approver_name']}){identity_note}",
                 thread_ts=target_thread_ts,
             )
     except Exception as e:

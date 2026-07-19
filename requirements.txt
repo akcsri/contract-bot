@@ -6,3 +6,4 @@ requests
 flask
 python-dotenv
 python-docx
+msoffcrypto-tool

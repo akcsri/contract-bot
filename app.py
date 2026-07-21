@@ -909,6 +909,22 @@ def process_contract_document(
         if not result.get("is_nda"):
             return
 
+        # 投稿者本人のfreeeトークンが登録されていない場合、金子さん名義への
+        # フォールバックはせず、自動申請自体を行わない(本人に手動申請を依頼する)。
+        identity = resolve_freee_identity(posting_slack_user_id)
+        if identity == "user" and posting_slack_user_id != AKIHIKO_SLACK_USER_ID:
+            logger.info(
+                f"[freee] 投稿者({posting_slack_user_id})のfreeeトークンが未登録のため、"
+                f"自動申請をスキップします: {filename}"
+            )
+            say(
+                ":warning: あなたのfreeeアカウントの認証情報(refresh_token)が登録されていないため、"
+                "このBotから自動でfreee申請することができません。"
+                "お手数ですが、freeeに直接ログインして、ご自身で手動申請してください。",
+                thread_ts=thread_ts,
+            )
+            return
+
         project_name = (result.get("project_name") or "").strip()
         method = (result.get("method") or "").strip()
         mail_address = (result.get("physical_mail_address") or "").strip()
@@ -940,13 +956,18 @@ def process_contract_document(
         # 毎回Slackスレッドで確認する(自動判定・自動デフォルトはしない)。
         missing_fields.append("approver")
 
-        # 申請者(applicant_id)はSlack投稿者に対応するfreeeユーザーID。
-        # 未登録の場合は金子さん名義にフォールバックし、確認メッセージで
-        # その旨を明示する(申請自体は失敗させない)。
+        # 申請者(applicant_id、表示用の参考情報)はSlack投稿者に対応するfreeeユーザーID。
+        # ここに到達した時点で投稿者は有効なfreeeトークンを持っている
+        # (=identityが解決できている)はずなので、通常は必ず見つかる。
+        # KNOWN_FREEE_USERSへの登録漏れ等の想定外ケースのみ金子さんにフォールバックする。
         applicant_id = find_applicant_id_by_slack_user(posting_slack_user_id)
         applicant_auto_defaulted = applicant_id is None
         if applicant_id is None:
-            applicant_id = KNOWN_FREEE_USERS.get(AKIHIKO_SLACK_USER_ID)  # 金子明彦にフォールバック
+            logger.warning(
+                f"[freee] 投稿者({posting_slack_user_id})はfreeeトークンを持つが"
+                "KNOWN_FREEE_USERSに未登録。金子さんのIDで代用します。"
+            )
+            applicant_id = KNOWN_FREEE_USERS.get(AKIHIKO_SLACK_USER_ID)
 
         pending = {
             "filename": filename,

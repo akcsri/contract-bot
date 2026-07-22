@@ -219,6 +219,25 @@ PROJECT_REPLY_PATTERN = re.compile(r"プロジェクト名?[:：]\s*(\S+)")
 METHOD_REPLY_PATTERN = re.compile(r"締結方法[:：]\s*(.+)")
 APPROVER_REPLY_PATTERN = re.compile(r"承認者[:：]\s*(\S+)")
 
+# --- 「捺印・電子署名の依頼」投稿かどうかの判定(アドミチームへのメンション) ---
+# signature_requestチャンネルには、捺印/電子署名が完了した書類の共有(処理不要)
+# など添付ファイル付きの投稿が他にも流れてくるため、依頼の投稿ルール上必ず
+# 付くアドミチームへのメンションの有無で「処理すべき依頼」かどうかを判定する。
+# (文面のキーワード判定は「捺印済みです」等の完了報告にも反応してしまい
+# 不安定なため採用しない)
+ADMIN_TEAM_SLACK_IDS = {
+    "U06MND3BB6E",  # 吉田愛美
+    "U07PUQG9NNQ",  # 金子明彦
+    "U07UBPGDT7X",  # 川端真至
+}
+SLACK_MENTION_PATTERN = re.compile(r"<@([A-Z0-9]+)(?:\|[^>]+)?>")
+
+
+def mentions_admin_team(text: str) -> bool:
+    """投稿本文にアドミチームの誰かへのメンションが含まれるか判定する。"""
+    mentioned_ids = set(SLACK_MENTION_PATTERN.findall(text or ""))
+    return bool(mentioned_ids & ADMIN_TEAM_SLACK_IDS)
+
 
 def build_nda_prompt(project_candidates: list) -> str:
     candidates_text = "、".join(project_candidates) if project_candidates else "(候補リスト取得不可)"
@@ -1042,8 +1061,16 @@ def handle_contract_files(event: dict, say):
     if not target_files:
         return
 
-    message_ts = event.get("ts")
     message_text = event.get("text", "")
+
+    if not mentions_admin_team(message_text):
+        logger.info(
+            "[FILE] アドミチームへのメンションが無いため、依頼投稿ではないと判断しスキップします "
+            f"(ts={event.get('ts')})"
+        )
+        return
+
+    message_ts = event.get("ts")
     posting_slack_user_id = event.get("user")
 
     # プロジェクト名の自動判定に使う候補一覧(KNOWN_PROJECT_SECTION_IDSより)

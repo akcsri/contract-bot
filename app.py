@@ -3,6 +3,7 @@ import io
 import re
 import time
 import json
+import base64
 import logging
 import datetime
 import unicodedata
@@ -90,6 +91,86 @@ _pending_nda = {}
 # 同一メッセージに複数のパスワード付きファイルがあると後勝ちで
 # 上書きされる制限があるが、通常1メッセージ1ファイルの運用のため許容している。
 _pending_password = {}
+
+# --- pending状態の永続化 ---------------------------------------------
+# Renderの再デプロイ/プロセス再起動を挟むと、上記の辞書はメモリ上のもの
+# なので消えてしまい、確認待ち中の申請やパスワード待ちのファイルが
+# 無反応のまま失われる問題があった。ここでは簡易的にJSONファイルへ
+# 保存/復元することで、再起動をまたいでも状態を復元できるようにする。
+#
+# 注意: Renderのサービスに永続ディスクをアタッチしていない場合、
+# 「再デプロイ」自体でファイルシステムごと初期化されるため、このファイル
+# も消えてしまう(=再デプロイをまたぐ耐性は無い)。プロセスのクラッシュ
+# 再起動など、ファイルシステムが保持されたままの再起動には耐えられる。
+# 再デプロイをまたいだ耐性が必要な場合は、Renderで永続ディスクを
+# アタッチし、PENDING_STATE_PATH環境変数にそのマウントパス配下のファイル
+# (例: /var/data/pending_state.json)を指定すること。
+PENDING_STATE_PATH = os.environ.get("PENDING_STATE_PATH", "pending_state.json")
+
+
+def _serialize_pending_entry(entry: dict) -> dict:
+    """raw_bytes(bytes型)をbase64文字列に変換し、JSON化できるようにする。"""
+    out = dict(entry)
+    raw = out.get("raw_bytes")
+    if isinstance(raw, (bytes, bytearray)):
+        out["raw_bytes"] = base64.b64encode(raw).decode("ascii")
+        out["_raw_bytes_b64"] = True
+    return out
+
+
+def _deserialize_pending_entry(entry: dict) -> dict:
+    """_serialize_pending_entryの逆変換。"""
+    out = dict(entry)
+    if out.pop("_raw_bytes_b64", False):
+        out["raw_bytes"] = base64.b64decode(out["raw_bytes"])
+    return out
+
+
+def save_pending_state():
+    """_pending_nda / _pending_password / _processed_file_ids をファイルに保存する。
+    保存に失敗しても本処理は継続する(永続化はベストエフォートであり、
+    ここで例外を上げてSlackへの応答自体を止めてはいけない)。
+    """
+    try:
+        data = {
+            "pending_nda": {
+                thread_ts: _serialize_pending_entry(p)
+                for thread_ts, p in _pending_nda.items()
+            },
+            "pending_password": {
+                thread_ts: _serialize_pending_entry(p)
+                for thread_ts, p in _pending_password.items()
+            },
+            "processed_file_ids": list(_processed_file_ids),
+        }
+        tmp_path = f"{PENDING_STATE_PATH}.tmp"
+        with open(tmp_path, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False)
+        os.replace(tmp_path, PENDING_STATE_PATH)
+    except Exception:
+        logger.exception("[state] pending状態の保存に失敗しました(処理は継続します)")
+
+
+def load_pending_state():
+    """起動時にファイルからpending状態を復元する(ファイルが無ければ何もしない)。"""
+    if not os.path.exists(PENDING_STATE_PATH):
+        logger.info(f"[state] 永続化ファイルが見つかりません({PENDING_STATE_PATH})。新規状態で起動します。")
+        return
+    try:
+        with open(PENDING_STATE_PATH, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        for thread_ts, entry in data.get("pending_nda", {}).items():
+            _pending_nda[thread_ts] = _deserialize_pending_entry(entry)
+        for thread_ts, entry in data.get("pending_password", {}).items():
+            _pending_password[thread_ts] = _deserialize_pending_entry(entry)
+        _processed_file_ids.update(data.get("processed_file_ids", []))
+        logger.info(
+            "[state] pending状態を復元しました "
+            f"(NDA確認待ち: {len(_pending_nda)}件, パスワード待ち: {len(_pending_password)}件, "
+            f"処理済みファイル: {len(_processed_file_ids)}件)"
+        )
+    except Exception:
+        logger.exception("[state] pending状態の復元に失敗しました(空の状態で起動します)")
 
 # --- プロジェクト名 → freee部門(section)ID の対応表(フォールバック用) ---
 # 管理者権限トークンが使えるようになったことで、プロジェクト名の判定は
@@ -1046,6 +1127,8 @@ def process_contract_document(
         else:
             post_confirmation(pending, thread_ts, say)
 
+        save_pending_state()
+
     except json.JSONDecodeError as e:
         logger.exception(f"[FILE] gemini response was not valid JSON: {filename}")
         say(f":warning: Geminiの解析結果を読み取れませんでした: {filename} ({e})")
@@ -1143,6 +1226,8 @@ def handle_contract_files(event: dict, say):
             posting_slack_user_id=posting_slack_user_id,
             project_candidates=project_candidates, say=say,
         )
+
+    save_pending_state()
 
 
 def strip_reply_chrome(s: str) -> str:
@@ -1274,9 +1359,11 @@ def handle_nda_field_reply(event: dict, say) -> bool:
 
     if missing:
         prompt_for_missing_fields(missing, thread_ts, say)
+        save_pending_state()
         return True
 
     post_confirmation(pending, thread_ts, say)
+    save_pending_state()
     return True
 
 
@@ -1458,6 +1545,14 @@ def handle_reaction_added(event, say, logger):
     if target_thread_ts is None:
         logger.warning(f"[reaction] 対応するpendingが見つかりません(message_ts={message_ts})。"
                         f"再デプロイ等でメモリ上の状態が失われた可能性があります。")
+        # Botの再起動・再デプロイ等でメモリ上の確認待ち状態が失われた場合、
+        # 何も反応が無いと利用者が気づけないため、その旨をSlack上にも伝える。
+        say(
+            ":warning: この確認メッセージに対応する情報が見つかりませんでした。"
+            "Botの再起動(再デプロイ)等により、確認待ちだった内容が失われた可能性があります。"
+            "お手数ですが契約書ファイルをもう一度投稿し直してください。",
+            thread_ts=message_ts,
+        )
         return
 
     pending = _pending_nda.pop(target_thread_ts)
@@ -1529,10 +1624,18 @@ def handle_reaction_added(event, say, logger):
     except Exception as e:
         logger.exception("[freee] approval request creation failed")
         say(f":warning: freee申請の作成に失敗しました: {e}", thread_ts=target_thread_ts)
+    finally:
+        # 成功/失敗どちらの場合も、popした後の状態を保存する。
+        # (途中でプロセスが強制終了された場合は保存自体が実行されず、
+        # ファイル上はpop前の状態のまま残るため、再起動後に同じリアクションで
+        # 再試行できる可能性が残る)
+        save_pending_state()
 
 
 if __name__ == "__main__":
     print("BOT START")
+
+    load_pending_state()
 
     handler = SocketModeHandler(
         app,

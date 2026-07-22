@@ -150,6 +150,22 @@ def find_approver_id_by_name(name: str):
     return _NORMALIZED_KNOWN_APPROVERS.get(normalize_name(name))
 
 
+# NDA申請の承認者として実際に選べる人はこの6名のみ(KNOWN_APPROVERS全体には
+# 他の承認経路等で使う人も含まれているが、NDA申請ではここに絞る)。
+# Slackで提示する選択肢、および受け付ける入力の両方をこの一覧に限定する。
+NDA_APPROVER_CHOICES = ["前田拓", "堀内駿太郎", "金井俊太朗", "池内遼", "金子明彦", "川端真至"]
+_NORMALIZED_NDA_APPROVER_CHOICES = {normalize_name(c) for c in NDA_APPROVER_CHOICES}
+
+
+def find_nda_approver_id_by_name(name: str):
+    """NDA申請の承認者選択肢(NDA_APPROVER_CHOICES)に限定して名前からIDを引く。
+    選択肢に無い名前(KNOWN_APPROVERSには存在する他の人など)はNoneを返す。
+    """
+    if normalize_name(name) not in _NORMALIZED_NDA_APPROVER_CHOICES:
+        return None
+    return find_approver_id_by_name(name)
+
+
 # 金子明彦さんご本人のSlackユーザーID(識別用の特別扱いに使う)
 AKIHIKO_SLACK_USER_ID = "U07PUQG9NNQ"
 
@@ -853,15 +869,14 @@ def prompt_for_missing_fields(missing_fields: list, thread_ts: str, say):
     if "method" in missing_fields:
         prompts.append(f"締結方法: <{' か '.join(CONTRACT_METHODS)}>")
     if "approver" in missing_fields:
-        prompts.append(f"承認者: <{' か '.join(KNOWN_APPROVERS.keys())}>")
+        prompts.append(f"承認者: <{' か '.join(NDA_APPROVER_CHOICES)}>")
     note = (
         "\n(プロジェクトに紐づかない契約書は「CSRI」を指定してください)"
         if "project_name" in missing_fields else ""
     )
     say(
         "投稿内容・ファイル名・契約書の中身から自動判定を試みましたが、"
-        "次の項目が確認できませんでした。このスレッドで返信してください"
-        "(承認者は毎回、人が選んで確認する運用のため必ず聞いています)。\n"
+        "次の項目が確認できませんでした。このスレッドで返信してください。\n"
         f"`{' / '.join(prompts)}`" + note,
         thread_ts=thread_ts,
     )
@@ -952,9 +967,23 @@ def process_contract_document(
         if method not in CONTRACT_METHODS:
             missing_fields.append("method")
             method = ""
-        # 承認者はプロジェクト/契約内容から自動的に決まらない人の判断のため、
-        # 毎回Slackスレッドで確認する(自動判定・自動デフォルトはしない)。
-        missing_fields.append("approver")
+
+        # 承認者は、投稿本文に「承認者: <名前>」のような記載があり、かつ
+        # それがNDA_APPROVER_CHOICESの選択肢に一致すれば、そのまま採用して
+        # 聞き返さない。記載が無い/選択肢に無い名前の場合のみ、後でSlack
+        # スレッドで確認する。
+        approver_id = None
+        approver_name = ""
+        m = APPROVER_REPLY_PATTERN.search(message_text)
+        if m:
+            candidate_name = strip_reply_chrome(m.group(1))
+            candidate_id = find_nda_approver_id_by_name(candidate_name)
+            if candidate_id is not None:
+                approver_id = candidate_id
+                approver_name = candidate_name
+                logger.info(f"[approver] 投稿本文から承認者を自動採用: {approver_name!r}")
+        if approver_id is None:
+            missing_fields.append("approver")
 
         # 申請者(applicant_id、表示用の参考情報)はSlack投稿者に対応するfreeeユーザーID。
         # ここに到達した時点で投稿者は有効なfreeeトークンを持っている
@@ -978,8 +1007,8 @@ def process_contract_document(
             "project_auto_defaulted": project_auto_defaulted,
             "method": method,
             "mail_address": mail_address if method == "原本捺印" else "",
-            "approver_id": None,
-            "approver_name": "",
+            "approver_id": approver_id,
+            "approver_name": approver_name,
             "posting_slack_user_id": posting_slack_user_id,
             "applicant_id": applicant_id,
             "applicant_auto_defaulted": applicant_auto_defaulted,
@@ -1190,19 +1219,17 @@ def handle_nda_field_reply(event: dict, say) -> bool:
         m = APPROVER_REPLY_PATTERN.search(text)
         if m:
             approver_name = strip_reply_chrome(m.group(1))
-            approver_id = find_approver_id_by_name(approver_name)
+            approver_id = find_nda_approver_id_by_name(approver_name)
             logger.info(
                 f"[approver] 抽出した名前: {approver_name!r} "
-                f"/ 対応表のキー一覧: {[k for k in KNOWN_APPROVERS]!r} "
+                f"/ 選択肢: {NDA_APPROVER_CHOICES!r} "
                 f"/ 一致: {approver_id is not None}"
             )
 
             if approver_id is None:
                 say(
-                    f":warning: 承認者「{approver_name}」は対応表(KNOWN_APPROVERS)に"
-                    "登録されていません。登録済みの名前と完全に一致させて返信するか、"
-                    "freeeの承認者選択画面等でその人のユーザーIDを確認してコードに"
-                    "追記してください。",
+                    f":warning: 承認者「{approver_name}」は選択肢にありません。"
+                    f"次のいずれかの名前で返信してください: {'、'.join(NDA_APPROVER_CHOICES)}",
                     thread_ts=thread_ts,
                 )
                 return True

@@ -80,6 +80,20 @@ app = App(
 
 gemini_client = genai.Client(api_key=os.environ["GEMINI_API_KEY"])
 
+# Bot自身のSlackユーザーIDのキャッシュ(reaction_addedで、リアクションされた
+# メッセージがBot自身の投稿かどうかを判定するために使う)。
+_bot_user_id_cache = {"id": None}
+
+
+def get_bot_user_id() -> str:
+    if _bot_user_id_cache["id"] is None:
+        try:
+            _bot_user_id_cache["id"] = app.client.auth_test()["user_id"]
+        except Exception:
+            logger.exception("[slack] auth_testによるBotユーザーID取得に失敗しました")
+            _bot_user_id_cache["id"] = ""
+    return _bot_user_id_cache["id"]
+
 # 二重処理防止(Slackのretry/イベント再送対策の簡易ガード)
 _processed_file_ids = set()
 
@@ -91,6 +105,15 @@ _pending_nda = {}
 # 同一メッセージに複数のパスワード付きファイルがあると後勝ちで
 # 上書きされる制限があるが、通常1メッセージ1ファイルの運用のため許容している。
 _pending_password = {}
+
+# Botが実際に投稿した「確認メッセージ(post_confirmation)」のtsの集合。
+# 運用チャンネルには他のメンバーの投稿やBotの他の返信(NDA判定結果等)にも
+# 日常的にリアクションが付くため、reaction_addedのたびに「対応する
+# pendingが見つかりません」という警告をSlackに出すと騒がしくなりすぎる。
+# このtsに含まれる(=かつてBotが実際に確認メッセージとして投稿した)
+# 場合のみ、pendingが見つからない状況を「再デプロイ等で本当に消えた」と
+# みなして警告を表示する。それ以外の無関係なリアクションは黙って無視する。
+_confirm_message_ts_seen = set()
 
 # --- pending状態の永続化 ---------------------------------------------
 # Renderの再デプロイ/プロセス再起動を挟むと、上記の辞書はメモリ上のもの
@@ -142,6 +165,7 @@ def save_pending_state():
                 for thread_ts, p in _pending_password.items()
             },
             "processed_file_ids": list(_processed_file_ids),
+            "confirm_message_ts_seen": list(_confirm_message_ts_seen),
         }
         tmp_path = f"{PENDING_STATE_PATH}.tmp"
         with open(tmp_path, "w", encoding="utf-8") as f:
@@ -164,10 +188,12 @@ def load_pending_state():
         for thread_ts, entry in data.get("pending_password", {}).items():
             _pending_password[thread_ts] = _deserialize_pending_entry(entry)
         _processed_file_ids.update(data.get("processed_file_ids", []))
+        _confirm_message_ts_seen.update(data.get("confirm_message_ts_seen", []))
         logger.info(
             "[state] pending状態を復元しました "
             f"(NDA確認待ち: {len(_pending_nda)}件, パスワード待ち: {len(_pending_password)}件, "
-            f"処理済みファイル: {len(_processed_file_ids)}件)"
+            f"処理済みファイル: {len(_processed_file_ids)}件, "
+            f"確認メッセージts記録: {len(_confirm_message_ts_seen)}件)"
         )
     except Exception:
         logger.exception("[state] pending状態の復元に失敗しました(空の状態で起動します)")
@@ -965,6 +991,7 @@ def post_confirmation(pending: dict, thread_ts: str, say):
     posted = say("\n".join(lines), thread_ts=thread_ts)
     pending["confirm_message_ts"] = posted["ts"]
     pending["stage"] = "awaiting_confirm"
+    _confirm_message_ts_seen.add(posted["ts"])
 
 
 def prompt_for_missing_fields(missing_fields: list, thread_ts: str, say):
@@ -1024,10 +1051,15 @@ def process_contract_document(
             meta_line = f"文字数: {len(text)}"
 
         logger.info(f"[FILE] gemini result: {result}")
-        say(format_analysis_message(filename, meta_line, result))
 
         if not result.get("is_nda"):
+            # NDAではないと判定された投稿(意向表明書などが多数流れてくる運用実態を
+            # 踏まえ)は、チャンネルを不必要な投稿で埋めないためSlackには何も
+            # 返信しない(ログにのみ記録する)。
+            logger.info(f"[FILE] NDAではないと判定のため、Slackへの返信はスキップします: {filename}")
             return
+
+        say(format_analysis_message(filename, meta_line, result))
 
         # 投稿者本人のfreeeトークンが登録されていない場合、金子さん名義への
         # フォールバックはせず、自動申請自体を行わない(本人に手動申請を依頼する)。
@@ -1507,8 +1539,9 @@ def handle_message(event, say, logger):
             say(f":warning: 経路一覧取得失敗: {e}")
         return
 
-    # ファイル無しの通常メッセージ(動作確認用)
-    say("イベント受信成功")
+    # ファイル無し・上記のいずれの返信/コマンドにも該当しない通常のメッセージ。
+    # 運用チャンネルには他の雑談・連絡も流れてくるため、Botは何も返信しない。
+    logger.info("[message] 対象外のメッセージのため無視します(返信なし)")
 
 
 @app.event("reaction_added")
@@ -1533,6 +1566,16 @@ def handle_reaction_added(event, say, logger):
         logger.info(f"[reaction] 対象外チャンネルのため無視: {item.get('channel')}")
         return
 
+    # 運用チャンネルでは、契約書の投稿そのものや他のBotメッセージ、他の
+    # メンバーの投稿にも日常的にリアクションが付く。確認メッセージへの
+    # リアクションで有り得るのは、リアクション対象がBot自身の投稿の場合のみ
+    # なので、それ以外は(pendingの有無を調べるまでもなく)黙って無視する。
+    item_user = event.get("item_user")
+    bot_user_id = get_bot_user_id()
+    if not bot_user_id or item_user != bot_user_id:
+        logger.info(f"[reaction] Bot以外の投稿へのリアクションのため無視: item_user={item_user}")
+        return
+
     logger.info(f"[reaction] 現在のpending件数: {len(_pending_nda)}, 検索対象message_ts: {message_ts}")
     logger.info(f"[reaction] pending一覧: { {k: v.get('confirm_message_ts') for k, v in _pending_nda.items()} }")
 
@@ -1543,16 +1586,22 @@ def handle_reaction_added(event, say, logger):
             break
 
     if target_thread_ts is None:
-        logger.warning(f"[reaction] 対応するpendingが見つかりません(message_ts={message_ts})。"
-                        f"再デプロイ等でメモリ上の状態が失われた可能性があります。")
-        # Botの再起動・再デプロイ等でメモリ上の確認待ち状態が失われた場合、
-        # 何も反応が無いと利用者が気づけないため、その旨をSlack上にも伝える。
-        say(
-            ":warning: この確認メッセージに対応する情報が見つかりませんでした。"
-            "Botの再起動(再デプロイ)等により、確認待ちだった内容が失われた可能性があります。"
-            "お手数ですが契約書ファイルをもう一度投稿し直してください。",
-            thread_ts=message_ts,
-        )
+        # message_tsが「かつて実際にBotが確認メッセージとして投稿したts」
+        # (_confirm_message_ts_seen)に含まれる場合のみ、再デプロイ等で
+        # 本当にpendingが失われたケースとみなしてSlackに警告を出す。
+        # それ以外(NDA判定結果やファイル受信通知など、確認メッセージ以外の
+        # Bot投稿へのリアクション)は、そもそも処理対象ではないため無視する。
+        if message_ts in _confirm_message_ts_seen:
+            logger.warning(f"[reaction] 対応するpendingが見つかりません(message_ts={message_ts})。"
+                            f"再デプロイ等でメモリ上の状態が失われた可能性があります。")
+            say(
+                ":warning: この確認メッセージに対応する情報が見つかりませんでした。"
+                "Botの再起動(再デプロイ)等により、確認待ちだった内容が失われた可能性があります。"
+                "お手数ですが契約書ファイルをもう一度投稿し直してください。",
+                thread_ts=message_ts,
+            )
+        else:
+            logger.info(f"[reaction] 確認メッセージ以外のBot投稿へのリアクションのため無視: message_ts={message_ts}")
         return
 
     pending = _pending_nda.pop(target_thread_ts)

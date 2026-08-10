@@ -1042,7 +1042,7 @@ def post_confirmation(pending: dict, thread_ts: str, say):
     _confirm_message_ts_seen.add(posted["ts"])
 
 
-def prompt_for_missing_fields(missing_fields: list, thread_ts: str, say):
+def prompt_for_missing_fields(missing_fields: list, thread_ts: str, say, signing_request_uncertain: bool = False):
     prompts = []
     if "project_name" in missing_fields:
         prompts.append("プロジェクト名: <プロジェクト名>")
@@ -1054,6 +1054,17 @@ def prompt_for_missing_fields(missing_fields: list, thread_ts: str, say):
         "\n(プロジェクトに紐づかない契約書は「CSRI」を指定してください)"
         if "project_name" in missing_fields else ""
     )
+    if "method" in missing_fields and signing_request_uncertain:
+        # 投稿本文から捺印/電子署名の依頼と確信を持って判定できなかった場合、
+        # 依頼の書き忘れの可能性もあるため打ち切らずに締結方法を尋ねるが、
+        # 実際は内容確認等が目的でdocumentationチャンネルの方が適切な場合も
+        # あることを併せて案内する。
+        note += (
+            "\n(この投稿が捺印・電子署名の依頼であるか確信が持てなかったため、"
+            "上記を確認しています。内容確認・共有のみが目的で捺印・電子署名の"
+            "依頼ではない場合は、恐れ入りますが`#documentation`チャンネルへの"
+            "投稿をお願いいたします)"
+        )
     say(
         "投稿内容・ファイル名・契約書の中身から自動判定を試みましたが、"
         "次の項目が確認できませんでした。このスレッドで返信してください。\n"
@@ -1100,21 +1111,14 @@ def process_contract_document(
 
         logger.info(f"[FILE] gemini result: {result}")
 
-        if not result.get("is_signing_request", True):
-            # 捺印/電子署名の依頼ではなく、内容確認・共有等が目的の投稿と
-            # 判断した場合は、締結方法/承認者等を聞く通常フローに進まず、
-            # documentationチャンネルへの投稿を促すメッセージのみ返す。
-            logger.info(
-                f"[FILE] 捺印/電子署名の依頼ではないと判断したため、"
-                f"documentationチャンネルへの案内のみ返信します: {filename}"
-            )
-            say(
-                ":information_source: このチャンネルは捺印・電子署名の依頼専用です。"
-                "内容確認・共有目的のご投稿と思われるため、恐れ入りますが"
-                "`#documentation` チャンネルへの投稿をお願いいたします。",
-                thread_ts=thread_ts,
-            )
-            return
+        # 投稿本文が捺印/電子署名の依頼と確信を持って判定できなかった場合でも、
+        # (依頼の書き忘れである可能性もあるため)ここで処理を打ち切って
+        # documentationチャンネルへの案内だけを返すのではなく、通常の
+        # 不足項目確認フローの中で締結方法を確認しつつ、documentationチャンネル
+        # が適切な場合があることも併せて案内する(後段のmissing_fields処理を参照)。
+        signing_request_uncertain = not result.get("is_signing_request", True)
+        if signing_request_uncertain:
+            logger.info(f"[FILE] 捺印/電子署名の依頼か確信が持てないため、締結方法の確認を促します: {filename}")
 
         if not result.get("is_nda"):
             # NDAではないと判定された投稿(意向表明書などが多数流れてくる運用実態を
@@ -1165,8 +1169,12 @@ def process_contract_document(
             # CSRI自体が対応表に無い場合のみ(通常起きない)、聞き返しにフォールバック
             missing_fields.append("project_name")
             project_name = ""
-        if method not in CONTRACT_METHODS:
-            missing_fields.append("method")
+        if method not in CONTRACT_METHODS or signing_request_uncertain:
+            # signing_request_uncertain(捺印/電子署名の依頼か確信が持てない)場合は、
+            # method既知でも念のため締結方法を確認しにいく(依頼の書き忘れの可能性が
+            # あるため、ここで打ち切らずに必要な情報を尋ねる)。
+            if "method" not in missing_fields:
+                missing_fields.append("method")
             method = ""
 
         # 承認者は、投稿本文に「承認者: <名前>」のような記載があり、かつ
@@ -1214,12 +1222,13 @@ def process_contract_document(
             "applicant_id": applicant_id,
             "applicant_auto_defaulted": applicant_auto_defaulted,
             "missing_fields": missing_fields,
+            "signing_request_uncertain": signing_request_uncertain,
             "stage": "awaiting_fields" if missing_fields else "awaiting_confirm",
         }
         _pending_nda[thread_ts] = pending
 
         if missing_fields:
-            prompt_for_missing_fields(missing_fields, thread_ts, say)
+            prompt_for_missing_fields(missing_fields, thread_ts, say, signing_request_uncertain=signing_request_uncertain)
         else:
             post_confirmation(pending, thread_ts, say)
 
@@ -1454,7 +1463,10 @@ def handle_nda_field_reply(event: dict, say) -> bool:
     pending["missing_fields"] = missing
 
     if missing:
-        prompt_for_missing_fields(missing, thread_ts, say)
+        prompt_for_missing_fields(
+            missing, thread_ts, say,
+            signing_request_uncertain=pending.get("signing_request_uncertain", False),
+        )
         save_pending_state()
         return True
 

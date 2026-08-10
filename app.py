@@ -9,7 +9,7 @@ import datetime
 import unicodedata
 
 import requests
-import fitz  # PyMuPDF
+import pymupdf as fitz  # PyMuPDF(`import fitz`は将来廃止予定のため新APIに切り替え)
 from docx import Document
 import msoffcrypto  # パスワード付きWord(.docx)の復号に使用(要requirements.txt追加)
 

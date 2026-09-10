@@ -492,8 +492,58 @@ def extract_docx_text(docx_bytes: bytes) -> str:
 # 開くのにパスワードが必要な(暗号化された)PDF/Wordファイルへの対応。
 # Slack投稿本文に「パスワード: xxxx」等の記載があればそれを使い、
 # 記載が無ければスレッドで聞き返す(handle_password_reply参照)。
+#
+# 2026-09-10: 「(PW Link2026!)」のようにコロン無しで記載される運用が
+# 実際には多く、従来の正規表現(コロン必須)では拾えず、既にパスワードが
+# 書かれている投稿に対しても毎回スレッドで聞き返してしまっていた
+# (#signature_request参照。聞き返した結果パスワードがチャンネルに
+# 平文で再送されることにもなり、運用上好ましくなかった)。そのため、
+# コロンに加えて、単なる空白区切りや「PWは以下となります。」のような
+# 言い回しの後に続くパターンも拾えるように拡張した。あくまで実運用で
+# 見られた表記の範囲をカバーする簡易的なものであり、完全な自然言語解析
+# ではない点に注意。
+PASSWORD_REPLY_PATTERN = re.compile(
+    r"(?:パスワード|ぱすわーど|\bpw(?![a-zA-Z])|\bpass(?:word)?(?![a-zA-Z]))"  # マーカー(PW/パスワード等)
+    r"(?:[はが])?"                                                    # 「PWは」等の助詞(任意)
+    r"(?:\s*[:：]"                                                    # 半角/全角コロン区切り
+    r"|\s*は?以下の?(?:とおり|通り)?(?:となります|です)?[。.、]?"      # 「(PWは)以下となります。」等の言い回し
+    r")?"
+    r"[\s　]*"                                                    # 区切りの後の空白・改行(\sは改行も含む)
+    r"[\*`\"'「『]*"                                                  # 強調記号等の前置装飾(任意)
+    r"([^\s　)）\]】」』\"'`*]+)",                                 # パスワード本体
+    re.IGNORECASE,
+)
 
-PASSWORD_REPLY_PATTERN = re.compile(r"(?:パスワード|ぱすわーど|pw|pass(?:word)?)[:：]\s*(\S+)", re.IGNORECASE)
+
+def _looks_like_password_candidate(candidate: str) -> bool:
+    """抽出したパスワード候補が「パスワードらしい」か簡易チェックする。
+
+    実運用で見られるパスワードはURLエンコード文字列や英数記号のみ
+    (例: Link2026!, csriatk2026, %5BCWN)で構成されている。マーカーの
+    後に「は別途お伝えします」のような地の文が続くケースで、その続きの
+    文章を誤ってパスワードとして拾ってしまわないよう、ASCII印字可能
+    文字のみで構成されているかどうかで簡易判定する。
+    """
+    if not candidate:
+        return False
+    return all(0x21 <= ord(ch) <= 0x7E for ch in candidate)
+
+
+def extract_password_from_text(text: str):
+    """投稿本文中の「PW」「パスワード」等の記載からパスワードを抽出する。
+
+    マーカーが見つからない場合、または抽出結果がパスワードらしくない
+    (地の文の続きを誤って拾った可能性が高い)場合はNoneを返す。Noneの
+    場合、呼び出し元は従来通りスレッドでパスワードを聞き返す。
+    """
+    m = PASSWORD_REPLY_PATTERN.search(text or "")
+    if not m:
+        return None
+    candidate = strip_reply_chrome(m.group(1))
+    if not _looks_like_password_candidate(candidate):
+        logger.info(f"[password] マーカーは見つかりましたがパスワードらしくないため無視します: {candidate!r}")
+        return None
+    return candidate
 
 
 def is_pdf_password_protected(raw_bytes: bytes) -> bool:
@@ -1288,8 +1338,9 @@ def handle_contract_files(event: dict, say):
         # --- パスワード保護されたファイルへの対応 ---------------------
         is_protected = is_pdf_password_protected(raw_bytes) if is_pdf else is_docx_password_protected(raw_bytes)
         if is_protected:
-            m = PASSWORD_REPLY_PATTERN.search(message_text)
-            password = strip_reply_chrome(m.group(1)) if m else None
+            # 投稿本文に「PW」「パスワード」等の記載があれば自動抽出して使う。
+            # 見つからない場合のみ、これまで通りスレッドで聞き返す。
+            password = extract_password_from_text(message_text)
 
             if password:
                 decrypted = decrypt_pdf(raw_bytes, password) if is_pdf else decrypt_docx(raw_bytes, password)
@@ -1337,10 +1388,12 @@ def handle_contract_files(event: dict, say):
 
 
 def strip_reply_chrome(s: str) -> str:
-    """返信からヒント文をそのままコピペした際に混入しがちな記号を除去する
-    (バッククォート `` ` `` や、ヒントの `<name>` 表記の山括弧など)。
+    """返信やメッセージ本文からパスワードを取り出す際に混入しがちな記号を
+    除去する(バッククォート `` ` `` 、ヒントの `<name>` 表記の山括弧、
+    強調のための `*`、「PWは以下となります」等でよく使われる全角/半角
+    括弧など)。
     """
-    return s.strip().strip("`<>「」\"'")
+    return s.strip().strip("`<>「」\"'*（）()")
 
 
 def handle_password_reply(event: dict, say) -> bool:

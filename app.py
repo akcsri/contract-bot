@@ -101,9 +101,18 @@ _processed_file_ids = set()
 # 注意: プロセス内メモリのみ。Renderの再起動で消える簡易実装。
 _pending_nda = {}
 
-# パスワード待ちのファイル(thread_ts をキーに保持)。
-# 同一メッセージに複数のパスワード付きファイルがあると後勝ちで
-# 上書きされる制限があるが、通常1メッセージ1ファイルの運用のため許容している。
+# パスワード待ちのファイル(thread_ts をキーに、ファイルごとのエントリの
+# リストを値として保持)。
+#
+# 2026-09-11: 以前は「thread_ts → 1エントリ」の単純な辞書だったため、
+# 同一メッセージに複数のパスワード付きファイルがあると後勝ちで上書きされ、
+# 先に処理したファイルのパスワード待ち状態が消えてしまう(=そのファイルは
+# 二度とパスワード解除・解析されない)という制限があった。実際に
+# #signature_requestで2ファイル添付の投稿があった際、片方(コミットメント
+# レター)がこの制限により一度も解析されないまま埋もれていたことを確認した
+# ため、リスト保持に変更した。スレッドへのパスワード返信は、その時点で
+# pending中の全ファイルに対して試し、合致するものだけを処理する
+# (handle_password_reply参照)。
 _pending_password = {}
 
 # Botが実際に投稿した「確認メッセージ(post_confirmation)」のtsの集合。
@@ -161,8 +170,8 @@ def save_pending_state():
                 for thread_ts, p in _pending_nda.items()
             },
             "pending_password": {
-                thread_ts: _serialize_pending_entry(p)
-                for thread_ts, p in _pending_password.items()
+                thread_ts: [_serialize_pending_entry(p) for p in entries]
+                for thread_ts, entries in _pending_password.items()
             },
             "processed_file_ids": list(_processed_file_ids),
             "confirm_message_ts_seen": list(_confirm_message_ts_seen),
@@ -185,13 +194,25 @@ def load_pending_state():
             data = json.load(f)
         for thread_ts, entry in data.get("pending_nda", {}).items():
             _pending_nda[thread_ts] = _deserialize_pending_entry(entry)
-        for thread_ts, entry in data.get("pending_password", {}).items():
-            _pending_password[thread_ts] = _deserialize_pending_entry(entry)
+        for thread_ts, entry_or_list in data.get("pending_password", {}).items():
+            # 2026-09-11: _pending_password はthread_tsごとに1エントリの辞書
+            # から、ファイルごとのエントリのリストに変更した。移行期間中、
+            # 変更前の形式(リストではなく単一の辞書)で保存された
+            # pending_state.jsonが残っている可能性があるため、後方互換の
+            # ために単一の辞書もリストへ読み替える。
+            if isinstance(entry_or_list, list):
+                _pending_password[thread_ts] = [
+                    _deserialize_pending_entry(e) for e in entry_or_list
+                ]
+            else:
+                _pending_password[thread_ts] = [_deserialize_pending_entry(entry_or_list)]
         _processed_file_ids.update(data.get("processed_file_ids", []))
         _confirm_message_ts_seen.update(data.get("confirm_message_ts_seen", []))
+        pending_password_file_count = sum(len(v) for v in _pending_password.values())
         logger.info(
             "[state] pending状態を復元しました "
-            f"(NDA確認待ち: {len(_pending_nda)}件, パスワード待ち: {len(_pending_password)}件, "
+            f"(NDA確認待ち: {len(_pending_nda)}件, "
+            f"パスワード待ち: {len(_pending_password)}スレッド/{pending_password_file_count}ファイル, "
             f"処理済みファイル: {len(_processed_file_ids)}件, "
             f"確認メッセージts記録: {len(_confirm_message_ts_seen)}件)"
         )
@@ -1367,14 +1388,17 @@ def handle_contract_files(event: dict, say):
                     thread_ts=thread_ts,
                 )
 
-            _pending_password[thread_ts] = {
+            # 同一メッセージ内の他のパスワード付きファイルを上書きしないよう、
+            # thread_tsごとにリストへ追加する(1つの辞書を上書きする形にはしない)。
+            _pending_password.setdefault(thread_ts, []).append({
+                "file_id": file_id,
                 "raw_bytes": raw_bytes,
                 "filename": filename,
                 "is_pdf": is_pdf,
                 "message_text": message_text,
                 "posting_slack_user_id": posting_slack_user_id,
                 "project_candidates": project_candidates,
-            }
+            })
             continue
 
         process_contract_document(
@@ -1400,11 +1424,18 @@ def handle_password_reply(event: dict, say) -> bool:
     """パスワード待ちのファイルへの返信を処理する。
     返信全体をパスワードとして扱う(「パスワード: xxx」の形式でも、
     xxxだけの直書きでもどちらでも受け付ける)。
+
+    2026-09-11: 同一スレッドに複数のパスワード待ちファイルがあり得るように
+    なった(_pending_password[thread_ts]がリストになった)ため、返信された
+    パスワードは、その時点でpending中の全ファイルに対して試す。複数ファイルが
+    同じパスワードで開くケース(1つのPWで送付ファイルまとめて暗号化している
+    運用)にも対応でき、開けなかったファイルだけを引き続きpendingとして残す。
+
     処理した場合True、対象外ならFalseを返す。
     """
     thread_ts = event.get("thread_ts")
-    pending = _pending_password.get(thread_ts)
-    if not pending:
+    pending_list = _pending_password.get(thread_ts)
+    if not pending_list:
         return False
 
     text = event.get("text", "")
@@ -1414,26 +1445,39 @@ def handle_password_reply(event: dict, say) -> bool:
     if not password:
         return False
 
-    filename = pending["filename"]
-    is_pdf = pending["is_pdf"]
-    decrypted = (
-        decrypt_pdf(pending["raw_bytes"], password)
-        if is_pdf
-        else decrypt_docx(pending["raw_bytes"], password)
-    )
+    matched = []
+    still_pending = []
+    for pending in pending_list:
+        is_pdf = pending["is_pdf"]
+        decrypted = (
+            decrypt_pdf(pending["raw_bytes"], password)
+            if is_pdf
+            else decrypt_docx(pending["raw_bytes"], password)
+        )
+        if decrypted is not None:
+            matched.append((pending, decrypted))
+        else:
+            still_pending.append(pending)
 
-    if decrypted is None:
+    if not matched:
+        # 1件も開けなかった場合、現時点でpending中の(まだ解決していない)
+        # ファイルをすべて案内する(複数ある場合はすべて列挙する)。
+        filenames = "、".join(f"*{p['filename']}*" for p in pending_list)
         say(
-            f":warning: そのパスワードでは *{filename}* を開けませんでした。"
+            f":warning: そのパスワードでは {filenames} を開けませんでした。"
             "もう一度、正しいパスワードを返信してください。",
             thread_ts=thread_ts,
         )
         return True
 
-    logger.info(f"[password] スレッド返信のパスワードで復号成功: {filename}")
-    _pending_password.pop(thread_ts, None)
-    # 2026-09-11: ここでsave_pending_state()を呼んでいなかったため、pop後も
-    # 永続化ファイル(pending_state.json)には解決済み(古い)pending状態が
+    # 開けたファイルはpendingから取り除く。開けなかったファイルは、別の
+    # パスワードの返信を待つため引き続きpendingのまま残す。
+    if still_pending:
+        _pending_password[thread_ts] = still_pending
+    else:
+        _pending_password.pop(thread_ts, None)
+    # 2026-09-11: ここでsave_pending_state()を呼んでいなかったため、pop/更新後も
+    # 永続化ファイル(pending_state.json)には解決前の(古い)pending状態が
     # 残ったままになっていた。この状態でRenderの再デプロイ/再起動が挟まると、
     # load_pending_state()で「既に正しいパスワードを受け取って処理済みのはずの
     # ファイル」がpassword待ちとして復活してしまい、その後の無関係なスレッド
@@ -1442,16 +1486,28 @@ def handle_password_reply(event: dict, say) -> bool:
     # handle_reaction_added側は同様のpop後にsave_pending_state()を呼んでいる
     # (成功/失敗どちらの場合もfinallyで保存)ため、それに合わせる。
     save_pending_state()
-    process_contract_document(
-        raw_bytes=decrypted,
-        filename=filename,
-        is_pdf=is_pdf,
-        message_text=pending["message_text"],
-        thread_ts=thread_ts,
-        posting_slack_user_id=pending["posting_slack_user_id"],
-        project_candidates=pending["project_candidates"],
-        say=say,
-    )
+
+    for pending, decrypted in matched:
+        logger.info(f"[password] スレッド返信のパスワードで復号成功: {pending['filename']}")
+        process_contract_document(
+            raw_bytes=decrypted,
+            filename=pending["filename"],
+            is_pdf=pending["is_pdf"],
+            message_text=pending["message_text"],
+            thread_ts=thread_ts,
+            posting_slack_user_id=pending["posting_slack_user_id"],
+            project_candidates=pending["project_candidates"],
+            say=say,
+        )
+
+    if still_pending:
+        remaining_filenames = "、".join(f"*{p['filename']}*" for p in still_pending)
+        say(
+            f":unlock: 上記のパスワードで一部のファイルを解錠しました。"
+            f"引き続き {remaining_filenames} のパスワードをこのスレッドに返信してください。",
+            thread_ts=thread_ts,
+        )
+
     return True
 
 

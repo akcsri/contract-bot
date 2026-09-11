@@ -1432,6 +1432,16 @@ def handle_password_reply(event: dict, say) -> bool:
 
     logger.info(f"[password] スレッド返信のパスワードで復号成功: {filename}")
     _pending_password.pop(thread_ts, None)
+    # 2026-09-11: ここでsave_pending_state()を呼んでいなかったため、pop後も
+    # 永続化ファイル(pending_state.json)には解決済み(古い)pending状態が
+    # 残ったままになっていた。この状態でRenderの再デプロイ/再起動が挟まると、
+    # load_pending_state()で「既に正しいパスワードを受け取って処理済みのはずの
+    # ファイル」がpassword待ちとして復活してしまい、その後の無関係なスレッド
+    # 返信(お礼の一言など)を誤って「間違ったパスワード」として扱ってしまう
+    # 不具合が発生していた(#signature_request、2026-09-11に発覚)。
+    # handle_reaction_added側は同様のpop後にsave_pending_state()を呼んでいる
+    # (成功/失敗どちらの場合もfinallyで保存)ため、それに合わせる。
+    save_pending_state()
     process_contract_document(
         raw_bytes=decrypted,
         filename=filename,

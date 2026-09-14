@@ -139,6 +139,53 @@ _confirm_message_ts_seen = set()
 # (例: /var/data/pending_state.json)を指定すること。
 PENDING_STATE_PATH = os.environ.get("PENDING_STATE_PATH", "pending_state.json")
 
+# パスワード待ち状態の有効期限(秒)。この期間を過ぎても返信が無かった
+# password待ちファイルは、以降そのスレッドに投稿される無関係なメッセージを
+# 誤って「間違ったパスワード」として扱ってしまう事故を防ぐため、自動的に
+# 無効化(破棄)する。デフォルトは7日間(土日・連休を挟んだ返信でも
+# 誤って失効しないよう、十分に余裕を持たせている)。
+#
+# 2026-09-11に、save_pending_state()の呼び忘れ(修正済み)が原因で、
+# 一度解決済みのはずのpassword待ち状態が古い永続化ファイルに残ったまま
+# 復活し、無関係なスレッド返信を誤ってパスワードの間違いとして扱ってしまう
+# 事象が発覚・修正したが、2026-09-14に同じスレッドで再発した。これは
+# 呼び忘れを直す「前」に保存された古いpending_state.jsonのエントリ
+# (created_atフィールドを持たない)が、修正後もそのまま残り続けていた
+# ため。created_atが無いエントリは無条件に期限切れとみなして破棄することで、
+# この既存の汚れたデータも自動的に解消されるようにした。
+PASSWORD_PENDING_EXPIRY_SECONDS = int(
+    os.environ.get("PASSWORD_PENDING_EXPIRY_SECONDS", str(7 * 24 * 60 * 60))
+)
+
+
+def _is_pending_password_entry_expired(pending: dict) -> bool:
+    """パスワード待ちエントリが期限切れかどうかを判定する。
+
+    created_atが無いエントリ(この仕組みを導入する前に保存された古い
+    データ)は、安全側に倒して無条件に期限切れとして扱う。
+    """
+    created_at = pending.get("created_at")
+    if created_at is None:
+        return True
+    return (time.time() - created_at) > PASSWORD_PENDING_EXPIRY_SECONDS
+
+
+def _purge_expired_password_pending() -> int:
+    """_pending_password全体から期限切れのエントリを取り除く。
+    取り除いた件数を返す(0件なら状態は変化していない)。
+    呼び出し元で、必要に応じてsave_pending_state()すること。
+    """
+    removed = 0
+    for thread_ts in list(_pending_password.keys()):
+        entries = _pending_password[thread_ts]
+        fresh = [p for p in entries if not _is_pending_password_entry_expired(p)]
+        removed += len(entries) - len(fresh)
+        if fresh:
+            _pending_password[thread_ts] = fresh
+        else:
+            _pending_password.pop(thread_ts, None)
+    return removed
+
 
 def _serialize_pending_entry(entry: dict) -> dict:
     """raw_bytes(bytes型)をbase64文字列に変換し、JSON化できるようにする。"""
@@ -208,6 +255,16 @@ def load_pending_state():
                 _pending_password[thread_ts] = [_deserialize_pending_entry(entry_or_list)]
         _processed_file_ids.update(data.get("processed_file_ids", []))
         _confirm_message_ts_seen.update(data.get("confirm_message_ts_seen", []))
+
+        # 起動時に、期限切れ(created_at無し = 導入前の古いデータを含む)の
+        # password待ちエントリを破棄しておく。これにより、過去の不具合で
+        # 永続化ファイルに残ってしまった解決済みのはずの古いpendingが
+        # 復活して誤反応する事故を、再起動のタイミングで自動的に解消できる。
+        purged = _purge_expired_password_pending()
+        if purged:
+            logger.info(f"[state] 期限切れのpassword待ちエントリを{purged}件破棄しました")
+            save_pending_state()
+
         pending_password_file_count = sum(len(v) for v in _pending_password.values())
         logger.info(
             "[state] pending状態を復元しました "
@@ -1398,6 +1455,8 @@ def handle_contract_files(event: dict, say):
                 "message_text": message_text,
                 "posting_slack_user_id": posting_slack_user_id,
                 "project_candidates": project_candidates,
+                # 期限切れ判定(_is_pending_password_entry_expired)に使う。
+                "created_at": time.time(),
             })
             continue
 
@@ -1435,6 +1494,26 @@ def handle_password_reply(event: dict, say) -> bool:
     """
     thread_ts = event.get("thread_ts")
     pending_list = _pending_password.get(thread_ts)
+    if not pending_list:
+        return False
+
+    # 期限切れ(created_at無しの古いデータを含む)のエントリをここでも
+    # 念のため取り除く。通常はload_pending_state()の起動時処理で
+    # 既に片付いているはずだが、プロセスを再起動せずに長時間稼働し続けた
+    # 場合の保険として、実際にスレッド返信があったタイミングでも
+    # チェックする。
+    fresh_list = [p for p in pending_list if not _is_pending_password_entry_expired(p)]
+    if len(fresh_list) != len(pending_list):
+        logger.info(
+            f"[password] 期限切れのpassword待ちエントリを破棄しました "
+            f"(thread_ts={thread_ts}, {len(pending_list) - len(fresh_list)}件)"
+        )
+        if fresh_list:
+            _pending_password[thread_ts] = fresh_list
+        else:
+            _pending_password.pop(thread_ts, None)
+        save_pending_state()
+    pending_list = fresh_list
     if not pending_list:
         return False
 

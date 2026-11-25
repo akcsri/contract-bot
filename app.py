@@ -402,6 +402,18 @@ DOCX_FILETYPES = {"docx"}
 
 # 不足項目を聞き返すときに使う個別パターン(どちらか一方だけの返信でも拾える)
 PROJECT_REPLY_PATTERN = re.compile(r"プロジェクト名?[:：]\s*(\S+)")
+
+# freee申請の必須項目「ドラフトデータ格納場所(BOX URL)」用。
+# Slackは本文中のURLを <https://...> や <https://...|表示名> の形で送ってくるため、
+# 「>」「|」や空白・括弧類の手前までをURLとして取り出す。
+# app.box.com / csri.app.box.com / box.com/s/... などBOXのドメイン全般に一致させる。
+BOX_URL_PATTERN = re.compile(r"https?://(?:[\w-]+\.)*box\.com/[^\s<>|()（）「」\"']+", re.IGNORECASE)
+
+
+def extract_box_url(text: str) -> str:
+    """投稿本文/返信からBOXのURLを1件取り出す(無ければ空文字)。"""
+    m = BOX_URL_PATTERN.search(text or "")
+    return m.group(0).rstrip(".,、。") if m else ""
 METHOD_REPLY_PATTERN = re.compile(r"締結方法[:：]\s*(.+)")
 APPROVER_REPLY_PATTERN = re.compile(r"承認者[:：]\s*(\S+)")
 
@@ -1064,7 +1076,7 @@ def create_nda_approval_request(
     *, title: str, contract_date: str,
     receipt_id: int, section_id: int, method: str, approver_id: int = None,
     applicant_id: int = None, partner_value: str = "", new_partner_name: str = "",
-    mail_address: str = "", draft: bool = False, identity: str = "user",
+    mail_address: str = "", box_url: str = "", draft: bool = False, identity: str = "user",
 ) -> dict:
     """NDA契約締結申請(freeeの汎用申請フォーム, form_id=87137)を作成する。
 
@@ -1107,16 +1119,20 @@ def create_nda_approval_request(
         "applicant_group_id": None,
         "observer_user_ids": [],
         "request_items": [
-            {"id": 346116, "type": "title", "value": title},
-            {"id": 57980, "type": "section", "value": str(section_id)},
-            {"id": 789358, "type": "single_line", "value": new_partner_name},
-            {"id": 32070, "type": "partner", "value": partner_value},
-            {"id": 293716, "type": "date", "value": contract_date},
-            {"id": 555747, "type": "receipt", "value": str(receipt_id)},
-            {"id": 647567, "type": "select", "value": method},
-            {"id": 757585, "type": "multi_line", "value": mail_address},
-            {"id": 757586, "type": "multi_line", "value": ""},
-            {"id": 757587, "type": "multi_line", "value": ""},
+            # 2026-11-25 フォーム改定(「ドラフトデータ格納場所(BOX URL)」必須項目の追加)
+            # に伴い全項目のidが振り直されたため更新。旧id: 346116/57980/789358/32070/
+            # 293716/555747/647567/757585-757587
+            {"id": 365480, "type": "title", "value": title},
+            {"id": 61609, "type": "section", "value": str(section_id)},
+            {"id": 841031, "type": "single_line", "value": new_partner_name},
+            {"id": 34177, "type": "partner", "value": partner_value},
+            {"id": 312776, "type": "date", "value": contract_date},
+            {"id": 587298, "type": "receipt", "value": str(receipt_id)},
+            {"id": 800466, "type": "multi_line", "value": box_url},  # ドラフトデータ格納場所(BOX URL) 必須
+            {"id": 690355, "type": "select", "value": method},
+            {"id": 800467, "type": "multi_line", "value": mail_address},  # 原本送付先
+            {"id": 800468, "type": "multi_line", "value": ""},  # CSRI発信の電子署名サイナー情報
+            {"id": 800469, "type": "multi_line", "value": ""},  # 差入型PDF送付先
         ],
     }
     if not draft:
@@ -1163,6 +1179,7 @@ def post_confirmation(pending: dict, thread_ts: str, say):
         f"申請者: freeeユーザーID {pending['applicant_id']}"
         + _describe_applicant_identity(pending.get("posting_slack_user_id")),
     ]
+    lines.append(f"ドラフト格納場所(BOX URL): {pending.get('box_url') or '未設定'}")
     if pending.get("mail_address"):
         lines.append(f"原本送付先: {pending['mail_address']}")
     posted = say("\n".join(lines), thread_ts=thread_ts)
@@ -1179,6 +1196,8 @@ def prompt_for_missing_fields(missing_fields: list, thread_ts: str, say, signing
         prompts.append(f"締結方法: <{' か '.join(CONTRACT_METHODS)}>")
     if "approver" in missing_fields:
         prompts.append(f"承認者: <{' か '.join(NDA_APPROVER_CHOICES)}>")
+    if "box_url" in missing_fields:
+        prompts.append("BOX URL: <ドラフトを格納したBOXフォルダ/ファイルのURL>")
     note = (
         "\n(プロジェクトに紐づかない契約書は「CSRI」を指定してください)"
         if "project_name" in missing_fields else ""
@@ -1323,6 +1342,14 @@ def process_contract_document(
         if approver_id is None:
             missing_fields.append("approver")
 
+        # freee申請の必須項目「ドラフトデータ格納場所(BOX URL)」。
+        # 投稿本文にBOXのリンクがあればそれを採用し、無ければスレッドで聞き返す。
+        box_url = extract_box_url(message_text)
+        if box_url:
+            logger.info(f"[box_url] 投稿本文からBOX URLを自動採用: {box_url}")
+        else:
+            missing_fields.append("box_url")
+
         # 申請者(applicant_id、表示用の参考情報)はSlack投稿者に対応するfreeeユーザーID。
         # ここに到達した時点で投稿者は有効なfreeeトークンを持っている
         # (=identityが解決できている)はずなので、通常は必ず見つかる。
@@ -1345,6 +1372,7 @@ def process_contract_document(
             "project_auto_defaulted": project_auto_defaulted,
             "method": method,
             "mail_address": mail_address if method == "原本捺印" else "",
+            "box_url": box_url,
             "approver_id": approver_id,
             "approver_name": approver_name,
             "posting_slack_user_id": posting_slack_user_id,
@@ -1659,6 +1687,13 @@ def handle_nda_field_reply(event: dict, say) -> bool:
             pending["approver_name"] = approver_name
             missing.remove("approver")
 
+    if "box_url" in missing:
+        # 「BOX URL:」のラベルが無く、リンクだけ貼られた返信でも受け付ける。
+        box_url = extract_box_url(text)
+        if box_url:
+            pending["box_url"] = box_url
+            missing.remove("box_url")
+
     pending["missing_fields"] = missing
 
     if missing:
@@ -1881,6 +1916,17 @@ def handle_reaction_added(event, say, logger):
 
     pending = _pending_nda.pop(target_thread_ts)
 
+    # BOX URL対応以前に作られた確認待ち(再起動で復元されたもの等)にはbox_urlが無い。
+    # freee側で必須のため、申請せずにスレッドでBOX URLを聞き返す。
+    if not pending.get("box_url"):
+        logger.info(f"[box_url] 確認待ちにBOX URLが無いため聞き返します: thread_ts={target_thread_ts}")
+        pending["missing_fields"] = ["box_url"]
+        pending["stage"] = "awaiting_fields"
+        _pending_nda[target_thread_ts] = pending
+        prompt_for_missing_fields(["box_url"], target_thread_ts, say)
+        save_pending_state()
+        return
+
     try:
         # 投稿者本人のfreeeトークンが登録されていれば、それを使って
         # (=その人自身の名義で)証憑アップロード・申請作成を行う。
@@ -1912,6 +1958,7 @@ def handle_reaction_added(event, say, logger):
         )
         approval = create_nda_approval_request(
             title=contract_title,
+            box_url=pending["box_url"],
             contract_date=result.get("contract_date") or datetime.date.today().isoformat(),
             receipt_id=receipt_id,
             section_id=pending["section_id"],

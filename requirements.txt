@@ -1,6 +1,6 @@
 slack-bolt==1.23.0
 slack-sdk==3.35.0
-google-genai
+google-genai==3.6.1
 PyMuPDF
 requests
 flask

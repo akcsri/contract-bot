@@ -78,7 +78,13 @@ app = App(
     logger=logger,
 )
 
-gemini_client = genai.Client(api_key=os.environ["GEMINI_API_KEY"])
+# google-genai 3.x から既定のAPIバージョンが v1beta → v1 に変わった。
+# v1 では JSON mode(response_mime_type="application/json")が使えず
+# 400 INVALID_ARGUMENT になるため、v1beta を明示する。
+gemini_client = genai.Client(
+    api_key=os.environ["GEMINI_API_KEY"],
+    http_options=types.HttpOptions(api_version="v1beta"),
+)
 
 # Bot自身のSlackユーザーIDのキャッシュ(reaction_addedで、リアクションされた
 # メッセージがBot自身の投稿かどうかを判定するために使う)。
